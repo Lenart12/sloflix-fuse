@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/xml"
 	"errors"
 	"fmt"
@@ -283,9 +284,28 @@ type nfoThumb struct {
 	URL    string `xml:",chardata"`
 }
 
+// dataImage turns a "data:image/<type>;base64,..." URI into a sidecar image file named base.<type>.
+func dataImage(uri, base string, mtime time.Time) (child, bool) {
+	typ, data, ok := strings.Cut(strings.TrimPrefix(uri, "data:image/"), ";base64,")
+	if !ok || len(typ) == len(uri) {
+		return child{}, false
+	}
+	b, err := base64.StdEncoding.DecodeString(data)
+	if err != nil {
+		return child{}, false
+	}
+	return child{name: base + "." + strings.Replace(typ, "jpeg", "jpg", 1), node: func() (fs.InodeEmbedder, error) {
+		f := &fs.MemRegularFile{Data: b}
+		f.Attr.Mode = 0444
+		f.Attr.SetTimes(nil, &mtime, &mtime)
+		return f, nil
+	}}, true
+}
+
 // nfoChild renders sloflix's metadata as a Jellyfin/Kodi NFO, so titles TMDB can't match still get a plot,
-// genres and artwork. Jellyfin downloads the image URLs itself.
-func nfoChild(file, root string, it item, plot string, mtime time.Time) child {
+// genres and artwork. Jellyfin downloads http(s) image URLs itself; images sloflix embeds as data: URIs (which
+// Jellyfin rejects in an NFO) become poster/fanart sidecar files instead.
+func nfoChild(file, root string, it item, plot string, mtime time.Time) []child {
 	// Title in Slovenian, as on sloflix. No originaltitle: sloflix only knows the Slovenian and English names,
 	// not the original-language one, so it's left for TMDB to fill when Jellyfin matches the item.
 	n := struct {
@@ -297,13 +317,23 @@ func nfoChild(file, root string, it item, plot string, mtime time.Time) child {
 		Poster  *nfoThumb  `xml:"thumb,omitempty"`
 		Fanart  []nfoThumb `xml:"fanart>thumb,omitempty"`
 	}{XMLName: xml.Name{Local: root}, Title: clean(it.Name), Year: it.Year, Plot: plot, Genres: it.Genres}
-	if it.Poster != "" {
-		n.Poster = &nfoThumb{Aspect: "poster", URL: it.Poster}
+	var out []child
+	art := func(uri, base string) string {
+		if strings.HasPrefix(uri, "http") {
+			return uri
+		}
+		if c, ok := dataImage(uri, base, mtime); ok {
+			out = append(out, c)
+		}
+		return ""
 	}
-	if it.Banner != "" {
-		n.Fanart = []nfoThumb{{URL: it.Banner}}
+	if u := art(it.Poster, "poster"); u != "" {
+		n.Poster = &nfoThumb{Aspect: "poster", URL: u}
 	}
-	return child{name: file, node: func() (fs.InodeEmbedder, error) {
+	if u := art(it.Banner, "fanart"); u != "" {
+		n.Fanart = []nfoThumb{{URL: u}}
+	}
+	return append(out, child{name: file, node: func() (fs.InodeEmbedder, error) {
 		b, err := xml.MarshalIndent(n, "", "  ")
 		if err != nil {
 			return nil, err
@@ -312,7 +342,7 @@ func nfoChild(file, root string, it item, plot string, mtime time.Time) child {
 		f.Attr.Mode = 0444
 		f.Attr.SetTimes(nil, &mtime, &mtime)
 		return f, nil
-	}}
+	}})
 }
 
 // uniq returns name, or name with " [id]" appended if it was already taken.
@@ -371,7 +401,7 @@ func movieDir(it item, name string) func() ([]child, error) {
 			return nil, nil
 		}
 		m, _ := info(it.ID)
-		return append(files, nfoChild("movie.nfo", "movie", it, m.Plot, mtimeOf(created, m))), nil
+		return append(files, nfoChild("movie.nfo", "movie", it, m.Plot, mtimeOf(created, m))...), nil
 	}
 }
 
@@ -382,7 +412,7 @@ func showDir(show item, name string) func() ([]child, error) {
 		if err != nil {
 			return nil, err
 		}
-		out := []child{nfoChild("tvshow.nfo", "tvshow", show, si.Plot, mtime)}
+		out := nfoChild("tvshow.nfo", "tvshow", show, si.Plot, mtime)
 		for _, s := range si.Seasons {
 			out = append(out, dirChild(fmt.Sprintf("Season %02d", s), mtime, seasonDir(show.ID, s, name)))
 		}

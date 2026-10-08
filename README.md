@@ -23,7 +23,7 @@ Shows/
 ## Features
 
 - **Streams on demand.** Opening a file fetches a fresh stream URL (from sloflix's direct link, or extracted from a DoodStream embed when there is none); reads are served from one HTTP range response per open file and only reconnect on seeks. Expired URLs and stalled connections are re-resolved automatically.
-- **Jellyfin layout.** `Name (Year)` folders, `SxxEyy` episodes, `.sl.vtt` sidecar subtitles, and NFO files carrying sloflix's Slovenian title, plot, genres, poster and backdrop. Titles TMDB can't match still get metadata.
+- **Jellyfin layout.** `Name (Year)` folders, `SxxEyy` episodes, `.sl.vtt` sidecar subtitles, and NFO files carrying sloflix's Slovenian title, plot, genres, poster and backdrop (images sloflix embeds inline become `poster.jpg`/`fanart.jpg` files). Titles TMDB can't match still get metadata.
 - **Gentle on upstream.** All API calls go through a rate limit (default 1/s) and a concurrency limit (default 3). Listings, file sizes and subtitles are cached on disk, so after the first library scan, later scans make no per-file requests.
 - **Tracks upstream changes.** Opening a file revalidates its size and subtitle, and a background task re-checks every title about once a week. Changed titles get a new mtime so Jellyfin re-probes them; titles whose source disappears drop out of the listing.
 - **Protects your library.** A listing refresh that loses more than 10% of its entries is treated as an upstream glitch: the previous list keeps being served (and retried hourly) unless the drop persists for 24 hours, so a bad API response can't make Jellyfin delete titles and their watch history.
