@@ -110,6 +110,7 @@ func (v *video) Getattr(ctx context.Context, f fs.FileHandle, out *fuse.AttrOut)
 }
 
 func (v *video) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
+	log.Printf("open %d: %s", v.id, v.Path(nil))
 	known, _, _ := readMeta(v.id)
 	resolve := func(force bool) (string, int64, error) {
 		u, size, err := streamURL(v.id, force)
