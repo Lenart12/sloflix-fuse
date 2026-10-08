@@ -76,9 +76,17 @@ func main() {
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		<-sig
-		if err := server.Unmount(); err != nil {
-			log.Printf("unmount: %v", err)
+		// Lazy unmount first: unlike a plain one it also propagates to busy copies of the mount (the host's and
+		// Jellyfin's in Docker), so stopping while files are open doesn't leave a dead mount behind. It needs
+		// root; otherwise fall back to fusermount.
+		if err := syscall.Unmount(*mount, syscall.MNT_DETACH); err != nil {
+			if err := server.Unmount(); err != nil {
+				log.Printf("unmount: %v", err)
+			}
+			return
 		}
+		// Files still open keep a detached mount's connection (and server.Wait) alive; don't wait for them.
+		time.AfterFunc(2*time.Second, func() { os.Exit(0) })
 	}()
 	server.Wait()
 }
