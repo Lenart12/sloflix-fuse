@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -377,20 +378,24 @@ func resolve(id int, hi bool) (string, meta, error) {
 	if stream != "" {
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
-		req, err := newRequest(ctx, "HEAD", stream, nil)
+		// A 1-byte range rather than HEAD: some sources are presigned S3/R2 URLs, signed for GET only.
+		req, err := newRequest(ctx, "GET", stream, nil)
 		if err != nil {
 			return "", meta{}, fmt.Errorf("media %d: %w", id, err)
 		}
 		req.Header.Set("Referer", referer)
+		req.Header.Set("Range", "bytes=0-0")
 		resp, err := cdnClient.Do(req)
 		if err != nil {
 			return "", meta{}, err
 		}
 		resp.Body.Close()
-		if resp.StatusCode != http.StatusOK || resp.ContentLength <= 0 {
-			return "", meta{}, fmt.Errorf("media %d: HEAD %s", id, resp.Status)
+		_, total, _ := strings.Cut(resp.Header.Get("Content-Range"), "/")
+		size, _ := strconv.ParseInt(total, 10, 64)
+		if resp.StatusCode != http.StatusPartialContent || size <= 0 {
+			return "", meta{}, fmt.Errorf("media %d: size probe %s, Content-Range %q", id, resp.Status, resp.Header.Get("Content-Range"))
 		}
-		m.Size = resp.ContentLength
+		m.Size = size
 	}
 	if prev, _, ok := readMeta(id); ok {
 		m.Changed = prev.Changed
