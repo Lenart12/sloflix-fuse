@@ -39,3 +39,23 @@ func TestDoodURL(t *testing.T) {
 		t.Fatalf("gone: %v", err)
 	}
 }
+
+func TestProbeSize(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/gone" {
+			w.Header().Set("Content-Type", "text/html")
+			w.Write([]byte("error_nofile"))
+			return
+		}
+		w.Header().Set("Content-Range", "bytes 0-0/12345")
+		w.WriteHeader(http.StatusPartialContent)
+		w.Write([]byte("x"))
+	}))
+	defer srv.Close()
+	if n, err := probeSize(srv.URL + "/ok"); err != nil || n != 12345 {
+		t.Fatalf("ok: %d %v", n, err)
+	}
+	if _, err := probeSize(srv.URL + "/gone"); !errors.Is(err, errFileGone) {
+		t.Fatalf("gone: %v", err)
+	}
+}

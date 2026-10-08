@@ -387,34 +387,27 @@ func resolve(id int, hi bool) (string, meta, error) {
 			doodCode, doodSub = path.Base(u.Path), s.Sub
 		}
 	}
-	var doodErr error
+	// missing is set when the source exists but its video is gone; that's persisted as no source, while
+	// other errors (dead hosts, timeouts) are transient.
+	var missing error
 	if stream == "" && doodCode != "" {
-		if stream, doodErr = doodURL(doodCode); doodErr != nil && !errors.Is(doodErr, errVideoGone) {
-			return "", meta{}, fmt.Errorf("media %d: %w", id, doodErr)
+		var err error
+		if stream, err = doodURL(doodCode); err != nil {
+			if !errors.Is(err, errVideoGone) {
+				return "", meta{}, fmt.Errorf("media %d: %w", id, err)
+			}
+			missing = fmt.Errorf("DoodStream %s: %w", doodCode, err)
 		}
 		if doodSub != nil {
 			m.Sub = *doodSub
 		}
 	}
 	if stream != "" {
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		defer cancel()
-		// A 1-byte range rather than HEAD: some sources are presigned S3/R2 URLs, signed for GET only.
-		req, err := newRequest(ctx, "GET", stream, nil)
-		if err != nil {
+		size, err := probeSize(stream)
+		if errors.Is(err, errFileGone) {
+			stream, missing = "", err
+		} else if err != nil {
 			return "", meta{}, fmt.Errorf("media %d: %w", id, err)
-		}
-		req.Header.Set("Referer", referer)
-		req.Header.Set("Range", "bytes=0-0")
-		resp, err := cdnClient.Do(req)
-		if err != nil {
-			return "", meta{}, err
-		}
-		resp.Body.Close()
-		_, total, _ := strings.Cut(resp.Header.Get("Content-Range"), "/")
-		size, _ := strconv.ParseInt(total, 10, 64)
-		if resp.StatusCode != http.StatusPartialContent || size <= 0 {
-			return "", meta{}, fmt.Errorf("media %d: size probe %s, Content-Range %q", id, resp.Status, resp.Header.Get("Content-Range"))
 		}
 		m.Size = size
 	}
@@ -426,8 +419,8 @@ func resolve(id int, hi bool) (string, meta, error) {
 		}
 	}
 	writeMeta(id, m)
-	if stream == "" && doodErr != nil {
-		return "", m, fmt.Errorf("media %d: no direct source: DoodStream %s: %w", id, doodCode, doodErr)
+	if stream == "" && missing != nil {
+		return "", m, fmt.Errorf("media %d: no direct source: %w", id, missing)
 	}
 	if stream == "" {
 		var got []string
@@ -441,6 +434,35 @@ func resolve(id int, hi bool) (string, meta, error) {
 	urls[id] = urlEntry{stream, m.Size, time.Now()}
 	urlMu.Unlock()
 	return stream, m, nil
+}
+
+var errFileGone = errors.New("file deleted from CDN (error_nofile)")
+
+// probeSize returns a stream's size from a 1-byte range request. Not HEAD: some sources are presigned
+// S3/R2 URLs, signed for GET only. A DoodStream CDN whose file is gone answers 200 with "error_nofile".
+func probeSize(stream string) (int64, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	req, err := newRequest(ctx, "GET", stream, nil)
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("Referer", referer)
+	req.Header.Set("Range", "bytes=0-0")
+	resp, err := cdnClient.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	_, total, _ := strings.Cut(resp.Header.Get("Content-Range"), "/")
+	size, _ := strconv.ParseInt(total, 10, 64)
+	if resp.StatusCode == http.StatusPartialContent && size > 0 {
+		return size, nil
+	}
+	if b, _ := io.ReadAll(io.LimitReader(resp.Body, 64)); bytes.Contains(b, []byte("error_nofile")) {
+		return 0, errFileGone
+	}
+	return 0, fmt.Errorf("size probe %s, Content-Range %q", resp.Status, resp.Header.Get("Content-Range"))
 }
 
 var (
