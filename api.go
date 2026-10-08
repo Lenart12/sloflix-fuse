@@ -141,10 +141,15 @@ func cdnTransport() *http.Transport {
 	return t
 }
 
-func newRequest(method, u string, body io.Reader) *http.Request {
-	req, _ := http.NewRequest(method, u, body)
+// newRequest builds a request with the browser User-Agent. URLs partly come from upstream data, so an
+// invalid one is an error, not a panic.
+func newRequest(ctx context.Context, method, u string, body io.Reader) (*http.Request, error) {
+	req, err := http.NewRequestWithContext(ctx, method, u, body)
+	if err != nil {
+		return nil, err
+	}
 	req.Header.Set("User-Agent", userAgent)
-	return req
+	return req, nil
 }
 
 func login(hi bool) (string, error) {
@@ -160,7 +165,10 @@ func login(hi bool) (string, error) {
 	wait(hi)
 	log.Printf("api: login")
 	body, _ := json.Marshal(map[string]string{"username": username, "password": password})
-	req := newRequest("POST", apiBase+"/user/login", bytes.NewReader(body))
+	req, err := newRequest(context.Background(), "POST", apiBase+"/user/login", bytes.NewReader(body))
+	if err != nil {
+		return "", err
+	}
 	req.Header.Set("Content-Type", "application/json")
 	var r struct {
 		Status   string
@@ -201,7 +209,10 @@ func api(path string, out any, hi bool) error {
 		}
 		wait(hi)
 		log.Printf("api: GET %s", path)
-		req := newRequest("GET", apiBase+path, nil)
+		req, err := newRequest(context.Background(), "GET", apiBase+path, nil)
+		if err != nil {
+			return err
+		}
 		req.Header.Set("Authorization", "Bearer "+tok)
 		var r struct {
 			Status string
@@ -357,7 +368,7 @@ func resolve(id int, hi bool) (string, meta, error) {
 		if err != nil || u.Host != "player.sloflix.com" {
 			continue
 		}
-		stream = u.Query().Get("source")
+		stream = strings.TrimSpace(u.Query().Get("source")) // some carry a trailing newline
 		if s.Sub != nil {
 			m.Sub = *s.Sub
 		}
@@ -366,7 +377,10 @@ func resolve(id int, hi bool) (string, meta, error) {
 	if stream != "" {
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
-		req := newRequest("HEAD", stream, nil).WithContext(ctx)
+		req, err := newRequest(ctx, "HEAD", stream, nil)
+		if err != nil {
+			return "", meta{}, fmt.Errorf("media %d: %w", id, err)
+		}
 		req.Header.Set("Referer", referer)
 		resp, err := cdnClient.Do(req)
 		if err != nil {
@@ -505,7 +519,10 @@ func fetchSubtitle(loc string) (bool, error) {
 	defer acquire(false)()
 	wait(false)
 	log.Printf("sub: GET %s", loc)
-	req := newRequest("GET", subBase+url.PathEscape(loc), nil)
+	req, err := newRequest(context.Background(), "GET", subBase+url.PathEscape(loc), nil)
+	if err != nil {
+		return false, err
+	}
 	if etag, err := os.ReadFile(subFile(loc) + ".etag"); err == nil {
 		req.Header.Set("If-None-Match", string(etag))
 	}

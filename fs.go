@@ -159,7 +159,10 @@ func (s *stream) open(off int64) error {
 			return err
 		}
 		s.size = size
-		req := newRequest("GET", u, nil)
+		req, err := newRequest(context.Background(), "GET", u, nil)
+		if err != nil {
+			return err
+		}
 		req.Header.Set("Referer", referer)
 		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", off))
 		resp, err := cdnClient.Do(req)
