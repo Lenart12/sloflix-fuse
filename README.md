@@ -22,7 +22,7 @@ Shows/
 
 ## Features
 
-- **Streams on demand.** Opening a file fetches a fresh stream URL; reads are served from one HTTP range response per open file and only reconnect on seeks. Expired URLs and stalled connections are re-resolved automatically.
+- **Streams on demand.** Opening a file fetches a fresh stream URL (from sloflix's direct link, or extracted from a DoodStream embed when there is none); reads are served from one HTTP range response per open file and only reconnect on seeks. Expired URLs and stalled connections are re-resolved automatically.
 - **Jellyfin layout.** `Name (Year)` folders, `SxxEyy` episodes, `.sl.vtt` sidecar subtitles, and NFO files carrying sloflix's Slovenian title, plot, genres, poster and backdrop. Titles TMDB can't match still get metadata.
 - **Gentle on upstream.** All API calls go through a rate limit (default 1/s) and a concurrency limit (default 3). Listings, file sizes and subtitles are cached on disk, so after the first library scan, later scans make no per-file requests.
 - **Tracks upstream changes.** Opening a file revalidates its size and subtitle, and a background task re-checks every title about once a week. Changed titles get a new mtime so Jellyfin re-probes them; titles whose source disappears drop out of the listing.
@@ -108,7 +108,8 @@ The first time a title is listed costs one API call plus one HEAD request to the
 ## Limitations
 
 - The CDN serves about 550 kB/s per connection, roughly 2–3× a typical bitrate here. That's fine for direct play, but slow for anything that reads whole files.
-- Titles whose CDN host is unreachable are hidden and retried hourly. Titles without a direct (DoodStream) source are not listed.
+- Supported sources: sloflix's direct links (DoodStream CDN or presigned Cloudflare R2 URLs) and DoodStream embed/download links, which are resolved through a working DoodStream mirror because many of sloflix's embed links point at dead mirror domains. StreamP2P-only titles and titles whose DoodStream video was deleted are not listed; that was about 8% of the catalog when tested.
+- Titles whose CDN host is unreachable are hidden and retried hourly.
 - Sloflix only provides Slovenian and English titles. NFO files set the Slovenian title; the original-language title comes from TMDB when Jellyfin can match the item.
 - Requests send a browser User-Agent to pass Cloudflare. Stricter bot protection on sloflix's side would stop the mount from working.
 
