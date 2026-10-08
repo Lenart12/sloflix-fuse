@@ -8,10 +8,13 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand/v2"
 	"net/http"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -356,6 +359,7 @@ func resolve(id int, hi bool) (string, meta, error) {
 		Plot    string `json:"media_description"`
 		Sources []struct {
 			Source string  `json:"media_source"`
+			Name   string  `json:"media_source_name"`
 			Sub    *string `json:"subtitle_location"`
 		} `json:"media_sources"`
 	}
@@ -363,17 +367,34 @@ func resolve(id int, hi bool) (string, meta, error) {
 		return "", meta{}, err
 	}
 	m := meta{Plot: d.Plot}
-	var stream string
+	// Prefer sloflix's own direct link; otherwise extract one from a DoodStream embed.
+	var stream, doodCode string
+	var doodSub *string
 	for _, s := range d.Sources {
 		u, err := url.Parse(s.Source)
-		if err != nil || u.Host != "player.sloflix.com" {
+		if err != nil {
 			continue
 		}
-		stream = strings.TrimSpace(u.Query().Get("source")) // some carry a trailing newline
-		if s.Sub != nil {
-			m.Sub = *s.Sub
+		if u.Host == "player.sloflix.com" {
+			stream = strings.TrimSpace(u.Query().Get("source")) // some carry a trailing newline
+			if s.Sub != nil {
+				m.Sub = *s.Sub
+			}
+			break
 		}
-		break
+		// Embed (/e/) or download-page (/d/) links; the mirror serves either code under /e/.
+		if doodCode == "" && strings.Contains(s.Name, "DoodStream") && (strings.HasPrefix(u.Path, "/e/") || strings.HasPrefix(u.Path, "/d/")) {
+			doodCode, doodSub = path.Base(u.Path), s.Sub
+		}
+	}
+	var doodErr error
+	if stream == "" && doodCode != "" {
+		if stream, doodErr = doodURL(doodCode); doodErr != nil && !errors.Is(doodErr, errVideoGone) {
+			return "", meta{}, fmt.Errorf("media %d: %w", id, doodErr)
+		}
+		if doodSub != nil {
+			m.Sub = *doodSub
+		}
 	}
 	if stream != "" {
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -405,13 +426,77 @@ func resolve(id int, hi bool) (string, meta, error) {
 		}
 	}
 	writeMeta(id, m)
+	if stream == "" && doodErr != nil {
+		return "", m, fmt.Errorf("media %d: no direct source: DoodStream %s: %w", id, doodCode, doodErr)
+	}
 	if stream == "" {
-		return "", m, fmt.Errorf("media %d: no direct source", id)
+		var got []string
+		for _, s := range d.Sources {
+			u, _ := url.Parse(s.Source)
+			got = append(got, fmt.Sprintf("%s@%s", s.Name, u.Host))
+		}
+		return "", m, fmt.Errorf("media %d: no direct source (got %d: %v)", id, len(d.Sources), got)
 	}
 	urlMu.Lock()
 	urls[id] = urlEntry{stream, m.Size, time.Now()}
 	urlMu.Unlock()
 	return stream, m, nil
+}
+
+var (
+	// Many titles only carry a DoodStream embed link, often on a dead mirror domain. Video codes work on any
+	// mirror, so embeds are opened here instead.
+	doodMirror = "https://myvidplay.com/e/"
+
+	errVideoGone = errors.New("video not found on DoodStream")
+	passMD5      = regexp.MustCompile(`/pass_md5/[^'"]+`)
+)
+
+// doodURL turns a DoodStream video code into a direct, tokenized MP4 URL, the same way the embed player does:
+// the embed page names a /pass_md5/ path whose response is the file's base URL.
+func doodURL(code string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	get := func(u, ref string) ([]byte, *http.Response, error) {
+		req, err := newRequest(ctx, "GET", u, nil)
+		if err != nil {
+			return nil, nil, err
+		}
+		req.Header.Set("Referer", ref)
+		resp, err := cdnClient.Do(req)
+		if err != nil {
+			return nil, nil, err
+		}
+		defer resp.Body.Close()
+		b, err := io.ReadAll(resp.Body)
+		if err == nil && resp.StatusCode != http.StatusOK {
+			err = fmt.Errorf("doodstream %s: %s", u, resp.Status)
+		}
+		return b, resp, err
+	}
+	log.Printf("dood: GET %s", code)
+	page, resp, err := get(doodMirror+code, "https://www.sloflix.com/")
+	if err != nil {
+		return "", err
+	}
+	p := passMD5.Find(page)
+	if p == nil {
+		return "", errVideoGone
+	}
+	embed := resp.Request.URL // after the mirror's redirect
+	base, _, err := get(embed.Scheme+"://"+embed.Host+string(p), embed.String())
+	if err != nil {
+		return "", err
+	}
+	if !bytes.HasPrefix(base, []byte("https://")) {
+		return "", fmt.Errorf("doodstream %s: unexpected pass_md5 response %.40q", code, base)
+	}
+	const letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+	random := make([]byte, 10)
+	for i := range random {
+		random[i] = letters[rand.IntN(len(letters))]
+	}
+	return fmt.Sprintf("%s%s?token=%s&expiry=%d", base, random, path.Base(string(p)), time.Now().UnixMilli()), nil
 }
 
 // info returns persisted meta for id, resolving it if unknown. Items without a source are an error,
