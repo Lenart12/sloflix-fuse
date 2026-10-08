@@ -1,8 +1,8 @@
-# sloflix-fuse
+# sloflixfs
 
 A read-only FUSE filesystem that exposes the [sloflix.com](https://www.sloflix.com/) catalog as a Jellyfin-compatible media library. Video files are thin wrappers: their bytes are streamed on demand from the provider with HTTP range requests, so nothing but metadata is stored locally.
 
-Docker image: [`lenart12/sloflix-fuse`](https://hub.docker.com/r/lenart12/sloflix-fuse) (linux/amd64, linux/arm64).
+Docker image: [`lenart12/sloflixfs`](https://hub.docker.com/r/lenart12/sloflixfs) (linux/amd64, linux/arm64).
 
 > Unofficial project, not affiliated with sloflix. It uses the site's private web API, which may change or block it at any time. You need your own sloflix account.
 
@@ -34,14 +34,14 @@ Shows/
 Runs the mount and Jellyfin together. Requires a Linux host with FUSE (`/dev/fuse`).
 
 ```sh
-git clone https://github.com/Lenart12/sloflix-fuse.git
-cd sloflix-fuse
+git clone https://github.com/Lenart12/sloflixfs.git
+cd sloflixfs
 cp .env.example .env    # fill in SLOFLIX_USER and SLOFLIX_PASS
 docker compose pull
 docker compose up -d
 ```
 
-This runs the published `lenart12/sloflix-fuse` image. To build from source instead, use `docker compose up -d --build`. To update, run `docker compose pull && docker compose up -d`.
+This runs the published `lenart12/sloflixfs` image. To build from source instead, use `docker compose up -d --build`. To update, run `docker compose pull && docker compose up -d`.
 
 Jellyfin is then available at http://localhost:8096. Add two libraries:
 
@@ -69,8 +69,8 @@ For a first try, set `SLOFLIX_ARGS=-limit-movies 20 -limit-shows 2` in `.env` to
 Requires Go 1.25+ and FUSE 3 (`fusermount3`).
 
 ```sh
-go build -o sloflix-fuse .
-SLOFLIX_USER=... SLOFLIX_PASS=... ./sloflix-fuse -mount ~/sloflix
+go build -o sloflixfs .
+SLOFLIX_USER=... SLOFLIX_PASS=... ./sloflixfs -mount ~/sloflix
 ```
 
 To let another user (such as a `jellyfin` service account or a container) read the mount, add `user_allow_other` to `/etc/fuse.conf` and pass `-allow-other`. Unmount with `fusermount3 -u ~/sloflix` or by stopping the process.
@@ -82,7 +82,7 @@ Credentials come from the `SLOFLIX_USER` and `SLOFLIX_PASS` environment variable
 | Flag | Default | Description |
 |---|---|---|
 | `-mount` | (required) | Mountpoint; created if missing. |
-| `-cache` | `~/.cache/sloflix-fuse` | Cache directory (`/cache` in Docker). |
+| `-cache` | `~/.cache/sloflixfs` | Cache directory (`/cache` in Docker). |
 | `-refresh` | `12h` | How long catalog, season and episode listings are cached. |
 | `-revalidate` | `168h` | How often each title's size and subtitle are re-checked in the background. |
 | `-rate` | `1` | Max API requests per second. |
@@ -123,7 +123,7 @@ Release (multi-platform image):
 
 ```sh
 git tag vX.Y.Z && git push origin vX.Y.Z
-docker buildx build --platform linux/amd64,linux/arm64 -t lenart12/sloflix-fuse:X.Y.Z -t lenart12/sloflix-fuse:latest --push .
+docker buildx build --platform linux/amd64,linux/arm64 -t lenart12/sloflixfs:X.Y.Z -t lenart12/sloflixfs:latest --push .
 ```
 
 `api.go` holds the sloflix client, rate limiting and caches; `fs.go` the filesystem tree and streaming; `main.go` flags and mounting.

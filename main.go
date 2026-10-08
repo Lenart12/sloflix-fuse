@@ -17,7 +17,7 @@ import (
 func main() {
 	userCache, _ := os.UserCacheDir()
 	mount := flag.String("mount", "", "mountpoint (required)")
-	flag.StringVar(&cacheDir, "cache", filepath.Join(userCache, "sloflix-fuse"), "cache directory")
+	flag.StringVar(&cacheDir, "cache", filepath.Join(userCache, "sloflixfs"), "cache directory")
 	flag.DurationVar(&refreshTTL, "refresh", 12*time.Hour, "how long catalog listings are cached")
 	flag.DurationVar(&metaTTL, "revalidate", 7*24*time.Hour, "how often each title's size and subtitle are revalidated in the background")
 	rate := flag.Float64("rate", 1, "max API requests per second")
@@ -28,7 +28,7 @@ func main() {
 	flag.Parse()
 	username, password = os.Getenv("SLOFLIX_USER"), os.Getenv("SLOFLIX_PASS")
 	if *mount == "" || username == "" || password == "" {
-		log.Fatal("usage: SLOFLIX_USER=.. SLOFLIX_PASS=.. sloflix-fuse -mount DIR")
+		log.Fatal("usage: SLOFLIX_USER=.. SLOFLIX_PASS=.. sloflixfs -mount DIR")
 	}
 	if *rate <= 0 || *concurrency <= 0 {
 		log.Fatal("-rate and -concurrency must be positive")
@@ -59,7 +59,7 @@ func main() {
 		MountOptions: fuse.MountOptions{
 			AllowOther:         *allowOther,
 			FsName:             "sloflix",
-			Name:               "sloflix",
+			Name:               "sloflixfs",
 			SyncRead:           true,
 			DisableReadDirPlus: true,
 			MaxReadAhead:       1 << 20,

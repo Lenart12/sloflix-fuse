@@ -5,8 +5,8 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY *.go ./
-RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags="-s -w" -o /sloflix-fuse .
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags="-s -w" -o /sloflixfs .
 
 FROM alpine:3
-COPY --from=build /sloflix-fuse /usr/local/bin/
-CMD ["sloflix-fuse", "-mount", "/mnt/sloflix/library", "-cache", "/cache", "-allow-other"]
+COPY --from=build /sloflixfs /usr/local/bin/
+CMD ["sloflixfs", "-mount", "/mnt/sloflix/library", "-cache", "/cache", "-allow-other"]

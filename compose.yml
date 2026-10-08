@@ -3,11 +3,11 @@
 # dead by a crash can't stop the containers from starting, and sloflix clears it on startup.
 services:
   sloflix:
-    image: lenart12/sloflix-fuse:latest
+    image: lenart12/sloflixfs:latest
     build: .  # used by `docker compose up --build` to build from source instead
     restart: unless-stopped
     # SLOFLIX_ARGS in .env adds flags, e.g. "-limit-movies 10 -limit-shows 2".
-    command: sloflix-fuse -mount /mnt/sloflix/library -cache /cache -allow-other ${SLOFLIX_ARGS:-}
+    command: sloflixfs -mount /mnt/sloflix/library -cache /cache -allow-other ${SLOFLIX_ARGS:-}
     environment:
       SLOFLIX_USER: ${SLOFLIX_USER}
       SLOFLIX_PASS: ${SLOFLIX_PASS}

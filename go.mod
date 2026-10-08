@@ -1,4 +1,4 @@
-module github.com/Lenart12/sloflix-fuse
+module github.com/Lenart12/sloflixfs
 
 go 1.25.3
 
