@@ -8,7 +8,9 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
+	"net/url"
 	"slices"
 	"strings"
 	"sync"
@@ -303,6 +305,45 @@ func dataImage(uri, base string, mtime time.Time) (child, bool) {
 	}}, true
 }
 
+var (
+	hostMu sync.Mutex
+	hostOK = map[string]hostCheck{}
+)
+
+type hostCheck struct {
+	ok bool
+	at time.Time
+}
+
+// reachable reports whether an artwork URL's host accepts connections, checked once per failTTL per host.
+// Jellyfin aborts a whole metadata refresh when an image download times out, so a dead host must not
+// end up in an NFO.
+// ponytail: global lock, so a dead host's 5s dial briefly stalls other NFOs; per-host locks if it shows.
+func reachable(uri string) bool {
+	u, err := url.Parse(uri)
+	if err != nil || u.Hostname() == "" {
+		return false
+	}
+	port := u.Port()
+	if port == "" {
+		port = map[string]string{"http": "80", "https": "443"}[u.Scheme]
+	}
+	addr := net.JoinHostPort(u.Hostname(), port)
+	hostMu.Lock()
+	defer hostMu.Unlock()
+	if c, ok := hostOK[addr]; ok && time.Since(c.at) < failTTL {
+		return c.ok
+	}
+	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		log.Printf("artwork host %s unreachable, left out of NFOs: %v", addr, err)
+	} else {
+		conn.Close()
+	}
+	hostOK[addr] = hostCheck{err == nil, time.Now()}
+	return err == nil
+}
+
 // nfoChild renders sloflix's metadata as a Jellyfin/Kodi NFO, so titles TMDB can't match still get a plot,
 // genres and artwork. Jellyfin downloads http(s) image URLs itself; images sloflix embeds as data: URIs (which
 // Jellyfin rejects in an NFO) become poster/fanart sidecar files instead.
@@ -321,6 +362,9 @@ func nfoChild(file, root string, it item, plot string, mtime time.Time) []child 
 	var out []child
 	art := func(uri, base string) string {
 		if strings.HasPrefix(uri, "http") {
+			if !reachable(uri) {
+				return ""
+			}
 			return uri
 		}
 		if c, ok := dataImage(uri, base, mtime); ok {
