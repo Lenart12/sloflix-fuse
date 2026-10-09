@@ -34,7 +34,8 @@ func main() {
 		log.Fatal("-rate and -concurrency must be positive")
 	}
 	slots = make(chan struct{}, *concurrency)
-	go throttleLoop(time.Duration(float64(time.Second) / *rate))
+	go throttleLoop(time.Duration(float64(time.Second) / *rate), hiQ, loQ)
+	go throttleLoop(doodEvery, doodHiQ, doodLoQ)
 	for _, d := range []string{"json", "meta", "subs"} {
 		if err := os.MkdirAll(filepath.Join(cacheDir, d), 0755); err != nil {
 			log.Fatal(err)

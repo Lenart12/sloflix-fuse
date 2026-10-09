@@ -82,19 +82,28 @@ var (
 
 	hiQ = make(chan struct{})
 	loQ = make(chan struct{})
+	// DoodStream lookups have their own queue: playmogo.com (where every mirror redirects) allows 15 per
+	// IP per 5 minutes, then answers with RELOAD and a captcha for ~5 minutes (measured 2026-10-09).
+	doodHiQ = make(chan struct{})
+	doodLoQ = make(chan struct{})
 )
 
-// throttleLoop hands out one request slot per interval, preferring waiters on hiQ (playback) over loQ.
-func throttleLoop(every time.Duration) {
-	for range time.Tick(every) {
+// doodEvery spaces DoodStream lookups: 20s sustained exactly 15 per 5 minutes in testing; 21s adds margin.
+const doodEvery = 21 * time.Second
+
+// throttleLoop hands out one request slot at a time, at least every apart, preferring waiters on hi
+// (playback) over lo. The first slot after an idle period goes out at once, but never two back to back.
+func throttleLoop(every time.Duration, hi, lo chan struct{}) {
+	for {
 		select {
-		case hiQ <- struct{}{}:
+		case hi <- struct{}{}:
 		default:
 			select {
-			case hiQ <- struct{}{}:
-			case loQ <- struct{}{}:
+			case hi <- struct{}{}:
+			case lo <- struct{}{}:
 			}
 		}
+		time.Sleep(every)
 	}
 }
 
@@ -109,11 +118,14 @@ func acquire(hi bool) func() {
 	return func() { <-slots }
 }
 
-func wait(hi bool) {
+// wait takes a sloflix API slot.
+func wait(hi bool) { take(hi, hiQ, loQ) }
+
+func take(hi bool, hq, lq chan struct{}) {
 	if hi {
-		<-hiQ
+		<-hq
 	} else {
-		<-loQ
+		<-lq
 	}
 }
 
@@ -473,7 +485,8 @@ func episodes(showID, season int) ([]item, error) {
 
 // resolve fetches a fresh stream URL for id, records its size and subtitle in meta, and memoizes the URL.
 func resolve(id int, hi bool) (string, meta, error) {
-	defer acquire(hi)()
+	release := acquire(hi)
+	defer func() { release() }()
 	var d struct {
 		Plot    string `json:"media_description"`
 		Sources []struct {
@@ -515,6 +528,10 @@ func resolve(id int, hi bool) (string, meta, error) {
 		if doodCode == prev.DeadCode && prev.Size == 0 { // a title in goneGrace (Size > 0) is verified again
 			err = errVideoGone
 		} else {
+			// Give up the concurrency slot while queued for DoodStream, so lookups that don't need it go on.
+			release()
+			take(hi, doodHiQ, doodLoQ)
+			release = acquire(hi)
 			stream, err = doodURL(doodCode)
 		}
 		if err != nil {
