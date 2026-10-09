@@ -1,4 +1,4 @@
-package main
+package sloflix
 
 import (
 	"errors"
@@ -107,11 +107,11 @@ func TestResolveDoodSpelling(t *testing.T) {
 	if _, _, err := resolve(8, false); err == nil || !strings.Contains(err.Error(), "broken upload") {
 		t.Fatalf("tiny file: %v", err)
 	}
-	if _, err := info(8); err == nil {
+	if _, err := Info(8); err == nil {
 		t.Fatal("tiny file is listed")
 	}
-	writeMeta(9, meta{Size: 65536}) // recorded as playable before minVideoSize existed
-	if _, err := info(9); err == nil {
+	writeMeta(9, Meta{Size: 65536}) // recorded as playable before minVideoSize existed
+	if _, err := Info(9); err == nil {
 		t.Fatal("tiny file recorded earlier is listed")
 	}
 }

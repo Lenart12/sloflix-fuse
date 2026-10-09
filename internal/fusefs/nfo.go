@@ -1,15 +1,14 @@
-package main
+package fusefs
 
 import (
 	"encoding/base64"
 	"encoding/xml"
-	"log"
-	"net"
-	"net/url"
 	"strings"
 	"time"
 
 	"github.com/hanwen/go-fuse/v2/fs"
+
+	"github.com/Lenart12/sloflixfs/internal/sloflix"
 )
 
 type nfoThumb struct {
@@ -35,32 +34,10 @@ func dataImage(uri, base string, mtime time.Time) (child, bool) {
 	}}, true
 }
 
-// reachable reports whether an artwork URL's host accepts connections (remembered per host, see hostStatus).
-// Jellyfin aborts a whole metadata refresh when an image download times out, so a dead host must not
-// end up in an NFO.
-func reachable(uri string) bool {
-	u, err := url.Parse(uri)
-	if err != nil || u.Hostname() == "" {
-		return false
-	}
-	addr := hostPort(u)
-	if ok, known := hostStatus(addr); known {
-		return ok
-	}
-	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
-	if err == nil {
-		conn.Close()
-	}
-	if fails := hostResult(addr, err); err != nil {
-		log.Printf("artwork host %s unreachable (%d in a row), left out of NFOs: %v", addr, fails, err)
-	}
-	return err == nil
-}
-
 // nfoChild renders sloflix's metadata as a Jellyfin/Kodi NFO, so titles TMDB can't match still get a plot,
 // genres and artwork. Jellyfin downloads http(s) image URLs itself; images sloflix embeds as data: URIs (which
 // Jellyfin rejects in an NFO) become poster/fanart sidecar files instead.
-func nfoChild(file, root string, it item, plot string, mtime time.Time) []child {
+func nfoChild(file, root string, it sloflix.Item, plot string, mtime time.Time) []child {
 	// Title in Slovenian, as on sloflix. No originaltitle: sloflix only knows the Slovenian and English names,
 	// not the original-language one, so it's left for TMDB to fill when Jellyfin matches the item.
 	n := struct {
@@ -75,7 +52,7 @@ func nfoChild(file, root string, it item, plot string, mtime time.Time) []child 
 	var out []child
 	art := func(uri, base string) string {
 		if strings.HasPrefix(uri, "http") {
-			if !reachable(uri) {
+			if !sloflix.Reachable(uri) {
 				return ""
 			}
 			return uri

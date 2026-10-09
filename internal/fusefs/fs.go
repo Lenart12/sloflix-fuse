@@ -1,4 +1,6 @@
-package main
+// Package fusefs serves the sloflix catalog as a read-only FUSE filesystem in Jellyfin's layout: verified
+// titles only, with NFO and subtitle sidecars, and video files streamed from the CDN on demand.
+package fusefs
 
 import (
 	"context"
@@ -12,6 +14,8 @@ import (
 
 	"github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
+
+	"github.com/Lenart12/sloflixfs/internal/sloflix"
 )
 
 var startTime = time.Now()
@@ -96,9 +100,9 @@ type video struct {
 }
 
 func (v *video) Getattr(ctx context.Context, f fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
-	m, err := info(v.id)
+	m, err := sloflix.Info(v.id)
 	if err != nil {
-		if !quiet(err) {
+		if !sloflix.Quiet(err) {
 			log.Printf("getattr %d: %v", v.id, err)
 		}
 		return syscall.EIO
@@ -116,19 +120,19 @@ func (v *video) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, 
 		id:     v.id,
 		opened: time.Now(),
 		resolve: func(force bool) (string, error) {
-			u, _, err := streamURL(v.id, force)
+			u, _, err := sloflix.StreamURL(v.id, force)
 			return u, err
 		},
 		resized: func(size int64) {
-			setSize(v.id, size)
+			sloflix.SetSize(v.id, size)
 			// Drop the kernel's cached attrs so it stops clamping reads to the old size. Async: invalidating
 			// from inside the read that's still in flight on this inode could deadlock.
 			go v.NotifyContent(-1, 0)
 		},
 	}
 	// A new title's start, saved by the crawler: Jellyfin's probe is served from it without resolving a link.
-	if m, err := info(v.id); err == nil {
-		if f, err := os.Open(headFile(v.id)); err == nil {
+	if m, err := sloflix.Info(v.id); err == nil {
+		if f, err := os.Open(sloflix.HeadFile(v.id)); err == nil {
 			if st, err := f.Stat(); err == nil {
 				s.size, s.head, s.headLen = m.Size, f, st.Size()
 				return s, 0, 0
@@ -136,9 +140,9 @@ func (v *video) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, 
 			f.Close()
 		}
 	}
-	_, size, err := streamURL(v.id, false)
+	_, size, err := sloflix.StreamURL(v.id, false)
 	if err != nil {
-		if !quiet(err) {
+		if !sloflix.Quiet(err) {
 			log.Printf("open %d: %v", v.id, err)
 		}
 		return nil, 0, syscall.EIO
@@ -148,7 +152,7 @@ func (v *video) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, 
 }
 
 // mtimeOf bumps an item's mtime when its source or subtitle changed, so Jellyfin re-probes it.
-func mtimeOf(created time.Time, m meta) time.Time {
+func mtimeOf(created time.Time, m sloflix.Meta) time.Time {
 	if m.Changed.After(created) {
 		return m.Changed
 	}
@@ -157,7 +161,7 @@ func mtimeOf(created time.Time, m meta) time.Time {
 
 func subtitleNode(loc string, mtime time.Time) func() (fs.InodeEmbedder, error) {
 	return func() (fs.InodeEmbedder, error) {
-		b, err := subtitle(loc)
+		b, err := sloflix.Subtitle(loc)
 		if err != nil {
 			return nil, err
 		}
@@ -168,16 +172,8 @@ func subtitleNode(loc string, mtime time.Time) func() (fs.InodeEmbedder, error) 
 	}
 }
 
-func parseTime(s string) time.Time {
-	t, err := time.Parse(time.DateTime, s)
-	if err != nil {
-		return startTime
-	}
-	return t
-}
-
 // name is the item's folder/file name: English if available (it matches TMDB best).
-func name(it item) string {
+func name(it sloflix.Item) string {
 	if it.NameEn != "" {
 		return clean(it.NameEn)
 	}
@@ -199,7 +195,7 @@ func clean(name string) string {
 }
 
 // title is the Jellyfin folder name: "Name (Year)".
-func title(it item) string {
+func title(it sloflix.Item) string {
 	if it.Year > 0 {
 		return fmt.Sprintf("%s (%d)", name(it), it.Year)
 	}
@@ -218,7 +214,7 @@ func uniq(seen map[string]bool, name string, id int) string {
 // mediaFiles lists the video file and, if present, its subtitle for item id under base name.
 // Items the crawler hasn't verified as playable are left out.
 func mediaFiles(id int, base string, mtime time.Time) []child {
-	m, err := info(id)
+	m, err := sloflix.Info(id)
 	if err != nil {
 		return nil
 	}
@@ -235,14 +231,14 @@ func dirChild(name string, mtime time.Time, list func() ([]child, error)) child 
 
 // catalogDir lists the catalog of typ, newest first, capped at limit entries if limit > 0. Only titles that
 // pass visible are listed; they're checked lazily (see child.visible).
-func catalogDir(typ, limit int, visible func(id int) bool, itemDir func(it item, name string) func() ([]child, error)) func() ([]child, error) {
+func catalogDir(typ, limit int, visible func(id int) bool, itemDir func(it sloflix.Item, name string) func() ([]child, error)) func() ([]child, error) {
 	return func() ([]child, error) {
-		items, _ := peek[[]item](catalogKey(typ)) // stale is fine: the crawler refreshes listings
+		items := sloflix.CachedCatalog(typ)
 		seen := map[string]bool{}
 		var out []child
-		for _, it := range firstN(items, limit) {
+		for _, it := range sloflix.FirstN(items, limit) {
 			name := uniq(seen, title(it), it.ID) // hidden titles still take their name, so names stay stable
-			c := dirChild(name, parseTime(it.Created), itemDir(it, name))
+			c := dirChild(name, it.CreatedAt(), itemDir(it, name))
 			c.visible = func() bool { return visible(it.ID) }
 			out = append(out, c)
 		}
@@ -251,18 +247,18 @@ func catalogDir(typ, limit int, visible func(id int) bool, itemDir func(it item,
 }
 
 func movieVisible(id int) bool {
-	_, err := info(id)
+	_, err := sloflix.Info(id)
 	return err == nil
 }
 
 // showVisible reports whether any of a show's episodes is playable. It reads cached listings only, so
 // listing Shows never waits on upstream, even right after a restart before the crawler's first pass.
 func showVisible(id int) bool {
-	si, _ := peek[showInfo](showKey(id))
+	si := sloflix.CachedShow(id)
 	for _, s := range si.Seasons {
-		eps, _ := peek[[]item](episodesKey(id, s))
+		eps := sloflix.CachedEpisodes(id, s)
 		for _, ep := range eps {
-			if _, err := info(ep.ID); err == nil {
+			if _, err := sloflix.Info(ep.ID); err == nil {
 				return true
 			}
 		}
@@ -270,22 +266,22 @@ func showVisible(id int) bool {
 	return false
 }
 
-func movieDir(it item, name string) func() ([]child, error) {
-	created := parseTime(it.Created)
+func movieDir(it sloflix.Item, name string) func() ([]child, error) {
+	created := it.CreatedAt()
 	return func() ([]child, error) {
 		files := mediaFiles(it.ID, name, created)
 		if files == nil {
 			return nil, nil
 		}
-		m, _ := info(it.ID)
+		m, _ := sloflix.Info(it.ID)
 		return append(files, nfoChild("movie.nfo", "movie", it, m.Plot, mtimeOf(created, m))...), nil
 	}
 }
 
-func showDir(show item, name string) func() ([]child, error) {
-	mtime := parseTime(show.Created)
+func showDir(show sloflix.Item, name string) func() ([]child, error) {
+	mtime := show.CreatedAt()
 	return func() ([]child, error) {
-		si, _ := peek[showInfo](showKey(show.ID))
+		si := sloflix.CachedShow(show.ID)
 		out := nfoChild("tvshow.nfo", "tvshow", show, si.Plot, mtime)
 		for _, s := range si.Seasons {
 			list := seasonDir(show.ID, s, name)
@@ -300,18 +296,18 @@ func showDir(show item, name string) func() ([]child, error) {
 
 func seasonDir(showID, season int, showName string) func() ([]child, error) {
 	return func() ([]child, error) {
-		eps, _ := peek[[]item](episodesKey(showID, season))
+		eps := sloflix.CachedEpisodes(showID, season)
 		seen := map[string]bool{}
 		var out []child
 		for _, ep := range eps {
 			base := uniq(seen, fmt.Sprintf("%s S%02dE%02d", showName, season, ep.Episode), ep.ID)
-			out = append(out, mediaFiles(ep.ID, base, parseTime(ep.Created))...)
+			out = append(out, mediaFiles(ep.ID, base, ep.CreatedAt())...)
 		}
 		return out, nil
 	}
 }
 
-func newRoot(limitMovies, limitShows int) *dir {
+func NewRoot(limitMovies, limitShows int) *dir {
 	return &dir{mtime: startTime, list: func() ([]child, error) {
 		return []child{
 			dirChild("Movies", startTime, catalogDir(1, limitMovies, movieVisible, movieDir)),

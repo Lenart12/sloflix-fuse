@@ -1,4 +1,4 @@
-package main
+package fusefs
 
 import (
 	"bytes"
@@ -6,11 +6,12 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/Lenart12/sloflixfs/internal/sloflix"
 )
 
 func TestStream(t *testing.T) {
@@ -135,10 +136,11 @@ func TestStreamHead(t *testing.T) {
 		http.ServeContent(w, r, "f.mp4", time.Time{}, bytes.NewReader(data))
 	}))
 	defer srv.Close()
-	cacheDir = t.TempDir()
-	os.MkdirAll(filepath.Join(cacheDir, "heads"), 0755)
-	os.WriteFile(headFile(9), data[:1<<20], 0644)
-	f, _ := os.Open(headFile(9))
+	if err := sloflix.Start(sloflix.Config{CacheDir: t.TempDir(), Rate: 1, Concurrency: 1}); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(sloflix.HeadFile(9), data[:1<<20], 0644)
+	f, _ := os.Open(sloflix.HeadFile(9))
 	var resolves atomic.Int32
 	s := &stream{id: 9, size: int64(len(data)), head: f, headLen: 1 << 20, resolve: func(bool) (string, error) {
 		resolves.Add(1)
@@ -162,7 +164,7 @@ func TestStreamHead(t *testing.T) {
 		t.Fatalf("read past the head: resolves=%d", resolves.Load())
 	}
 	s.Release(context.Background())
-	if _, err := os.Stat(headFile(9)); !os.IsNotExist(err) {
+	if _, err := os.Stat(sloflix.HeadFile(9)); !os.IsNotExist(err) {
 		t.Fatalf("head not removed on close: %v", err)
 	}
 }
@@ -174,10 +176,11 @@ func TestStreamHeadResized(t *testing.T) {
 		http.ServeContent(w, r, "f.mp4", time.Time{}, bytes.NewReader(data))
 	}))
 	defer srv.Close()
-	cacheDir = t.TempDir()
-	os.MkdirAll(filepath.Join(cacheDir, "heads"), 0755)
-	os.WriteFile(headFile(9), bytes.Repeat([]byte("o"), 4096), 0644)
-	f, _ := os.Open(headFile(9))
+	if err := sloflix.Start(sloflix.Config{CacheDir: t.TempDir(), Rate: 1, Concurrency: 1}); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(sloflix.HeadFile(9), bytes.Repeat([]byte("o"), 4096), 0644)
+	f, _ := os.Open(sloflix.HeadFile(9))
 	s := &stream{id: 9, size: 2 << 20, head: f, headLen: 4096, resolve: func(bool) (string, error) { return srv.URL, nil }}
 	if _, errno := s.Read(context.Background(), make([]byte, 100), 8192); errno != 0 || s.size != int64(len(data)) {
 		t.Fatalf("first read past the head: errno=%v size=%d", errno, s.size)

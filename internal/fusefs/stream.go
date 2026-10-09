@@ -1,4 +1,4 @@
-package main
+package fusefs
 
 import (
 	"context"
@@ -15,6 +15,8 @@ import (
 	"time"
 
 	"github.com/hanwen/go-fuse/v2/fuse"
+
+	"github.com/Lenart12/sloflixfs/internal/sloflix"
 )
 
 // Forward gaps up to this size are read and discarded instead of opening a new connection.
@@ -57,13 +59,7 @@ func (s *stream) open(off int64) error {
 		if err != nil {
 			return err
 		}
-		req, err := newRequest(context.Background(), "GET", u, nil)
-		if err != nil {
-			return err
-		}
-		req.Header.Set("Referer", referer)
-		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", off))
-		resp, err := cdnDo(req)
+		resp, err := sloflix.GetRange(u, off)
 		if err != nil {
 			log.Printf("stream: %v", err)
 			continue
@@ -155,7 +151,7 @@ func (s *stream) Release(ctx context.Context) syscall.Errno {
 	if s.head != nil {
 		// Jellyfin probes a file once; later opens stream it.
 		s.head.Close()
-		os.Remove(headFile(s.id))
+		os.Remove(sloflix.HeadFile(s.id))
 	}
 	if s.conns > 0 || s.cached > 0 {
 		log.Printf("close %d: %d connections, %.1f MB in %v, %.1f MB from probe cache", s.id, s.conns, float64(s.read)/1e6, time.Since(s.opened).Round(100*time.Millisecond), float64(s.cached)/1e6)

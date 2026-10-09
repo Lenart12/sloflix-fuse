@@ -1,4 +1,4 @@
-package main
+package sloflix
 
 import (
 	"bytes"
@@ -16,6 +16,8 @@ import (
 	"sync"
 	"time"
 )
+
+var startTime = time.Now()
 
 var apiBase = "https://api.sloflix.com/v1" // a var for tests
 
@@ -43,7 +45,8 @@ var (
 	errFailedRecently = errors.New("lookup failed recently")
 )
 
-func quiet(err error) bool { return errors.Is(err, errNoSource) || errors.Is(err, errFailedRecently) }
+// Quiet reports whether err is one of those outcomes.
+func Quiet(err error) bool { return errors.Is(err, errNoSource) || errors.Is(err, errFailedRecently) }
 
 var (
 	cacheDir   string
@@ -85,7 +88,8 @@ type memEntry struct {
 	at time.Time
 }
 
-type item struct {
+// Item is a movie, show or episode from a catalog or season listing.
+type Item struct {
 	ID      int      `json:"media_id"`
 	Name    string   `json:"media_name"`
 	NameEn  string   `json:"media_name_en"`
@@ -97,7 +101,17 @@ type item struct {
 	Banner  string   `json:"media_banner_url"`
 }
 
-type showInfo struct {
+// CreatedAt is when the title was added to sloflix, or the process start if upstream sent no valid time.
+func (it Item) CreatedAt() time.Time {
+	t, err := time.Parse(time.DateTime, it.Created)
+	if err != nil {
+		return startTime
+	}
+	return t
+}
+
+// ShowInfo is a show's seasons and plot.
+type ShowInfo struct {
 	Seasons []int
 	Plot    string `json:"media_description"`
 }
@@ -270,21 +284,21 @@ func cached[T any](key string, fetch func() (T, error)) (T, error) {
 // entries counts a cached listing's entries for the shrink guard.
 func entries(v any) int {
 	switch v := v.(type) {
-	case []item:
+	case []Item:
 		return len(v)
-	case showInfo:
+	case ShowInfo:
 		return len(v.Seasons)
 	}
 	return 0
 }
 
 // catalog lists all movies (typ 1) or shows (typ 2).
-func catalog(typ int) ([]item, error) {
-	return cached(catalogKey(typ), func() ([]item, error) {
-		var all []item
+func catalog(typ int) ([]Item, error) {
+	return cached(catalogKey(typ), func() ([]Item, error) {
+		var all []Item
 		// 300 is the API's max page size.
 		for off := 0; ; off += 300 {
-			var page []item
+			var page []Item
 			if err := api(fmt.Sprintf("/media?sortBy=1&genres=&type=%d&query=&limit=300&offset=%d", typ, off), &page, false); err != nil {
 				return nil, err
 			}
@@ -296,8 +310,8 @@ func catalog(typ int) ([]item, error) {
 	})
 }
 
-// firstN returns the first n items, or all if n is 0 (the -limit-* flags).
-func firstN(items []item, n int) []item {
+// FirstN returns the first n items, or all if n is 0 (the -limit-* flags).
+func FirstN(items []Item, n int) []Item {
 	if n > 0 {
 		return items[:min(n, len(items))]
 	}
@@ -317,21 +331,30 @@ func peek[T any](key string) (T, bool) {
 	return v, err == nil && json.Unmarshal(b, &v) == nil
 }
 
+// CachedCatalog, CachedShow and CachedEpisodes return listings from the cache, however old, without
+// fetching, so listing the filesystem never waits on upstream. The crawler keeps them fresh.
+func CachedCatalog(typ int) []Item   { v, _ := peek[[]Item](catalogKey(typ)); return v }
+func CachedShow(showID int) ShowInfo { v, _ := peek[ShowInfo](showKey(showID)); return v }
+func CachedEpisodes(showID, season int) []Item {
+	v, _ := peek[[]Item](episodesKey(showID, season))
+	return v
+}
+
 func catalogKey(typ int) string             { return fmt.Sprintf("catalog-%d", typ) }
 func showKey(showID int) string             { return fmt.Sprintf("show-%d", showID) }
 func episodesKey(showID, season int) string { return fmt.Sprintf("episodes-%d-%d", showID, season) }
 
-func showMeta(showID int) (showInfo, error) {
-	return cached(showKey(showID), func() (showInfo, error) {
-		var d showInfo
+func showMeta(showID int) (ShowInfo, error) {
+	return cached(showKey(showID), func() (ShowInfo, error) {
+		var d ShowInfo
 		err := api(fmt.Sprintf("/media/single/%d?dont_count_view=true", showID), &d, false)
 		return d, err
 	})
 }
 
-func episodes(showID, season int) ([]item, error) {
-	return cached(episodesKey(showID, season), func() ([]item, error) {
-		var eps []item
+func episodes(showID, season int) ([]Item, error) {
+	return cached(episodesKey(showID, season), func() ([]Item, error) {
+		var eps []Item
 		err := api(fmt.Sprintf("/media/episodes/%d/%d", showID, season), &eps, false)
 		return eps, err
 	})
@@ -359,7 +382,8 @@ func subFile(loc string) string {
 	return filepath.Join(cacheDir, "subs", filepath.Base(loc))
 }
 
-func subtitle(loc string) ([]byte, error) {
+// Subtitle returns subtitle file loc, from the cache or downloaded.
+func Subtitle(loc string) ([]byte, error) {
 	if b, err := os.ReadFile(subFile(loc)); err == nil {
 		return b, nil
 	}

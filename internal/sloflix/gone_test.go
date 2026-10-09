@@ -1,4 +1,4 @@
-package main
+package sloflix
 
 import (
 	"net/http"
@@ -49,18 +49,18 @@ func TestGoneGrace(t *testing.T) {
 		}
 	}()
 
-	writeMeta(1, meta{Size: 100 << 20})
+	writeMeta(1, Meta{Size: 100 << 20})
 	if _, m, err := resolve(1, false); err == nil || m.Size != 100<<20 || m.Gone.IsZero() {
 		t.Fatalf("first gone: size=%d gone=%v err=%v", m.Size, m.Gone, err)
 	}
 	crawl(1) // recheck within grace
-	if m, err := info(1); err != nil || m.Size != 100<<20 {
+	if m, err := Info(1); err != nil || m.Size != 100<<20 {
 		t.Fatalf("within grace should stay listed: size=%d err=%v", m.Size, err)
 	}
 	delete(crawlFailed, 1)
 	captcha.Store(true) // a transient failure during the recheck
 	crawl(1)
-	if m, err := info(1); err != nil || m.Size != 100<<20 {
+	if m, err := Info(1); err != nil || m.Size != 100<<20 {
 		t.Fatalf("transient failure within grace should stay listed: size=%d err=%v", m.Size, err)
 	}
 	captcha.Store(false)
@@ -69,7 +69,7 @@ func TestGoneGrace(t *testing.T) {
 	m.Gone = time.Now().Add(-goneGrace - time.Minute)
 	writeMeta(1, m)
 	crawl(1)
-	if _, err := info(1); err == nil {
+	if _, err := Info(1); err == nil {
 		t.Fatal("after grace should be hidden")
 	}
 	if m, _, _ := readMeta(1); m.Size != 0 {
@@ -81,7 +81,7 @@ func TestGoneGrace(t *testing.T) {
 	}
 	delete(crawlFailed, 1) // the hide was a lookup failure; recheck for real
 	crawl(1)
-	if _, err := info(1); err == nil || doodCalls.Load() != 3 {
+	if _, err := Info(1); err == nil || doodCalls.Load() != 3 {
 		t.Fatalf("recheck of a hidden title: err=%v DoodStream requests=%d, want 3", err, doodCalls.Load())
 	}
 
@@ -89,7 +89,7 @@ func TestGoneGrace(t *testing.T) {
 	delete(failed, 1)
 	before := apiCalls.Load()
 	for range 2 {
-		if _, _, err := streamURL(1, false); err == nil {
+		if _, _, err := StreamURL(1, false); err == nil {
 			t.Fatal("streamURL of a gone title succeeded")
 		}
 	}

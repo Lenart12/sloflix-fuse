@@ -1,4 +1,4 @@
-package main
+package sloflix
 
 import (
 	"bytes"
@@ -68,6 +68,17 @@ func verifyCert(cs tls.ConnectionState, roots *x509.CertPool) error {
 		log.Printf("cdn: accepting expired certificate of %s (expired %s)", cs.ServerName, leaf.NotAfter.Format(time.DateOnly))
 	}
 	return nil
+}
+
+// GetRange requests stream URL u from byte off on, unless its video server is remembered as down.
+func GetRange(u string, off int64) (*http.Response, error) {
+	req, err := newRequest(context.Background(), "GET", u, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Referer", referer)
+	req.Header.Set("Range", fmt.Sprintf("bytes=%d-", off))
+	return cdnDo(req)
 }
 
 // cdnDo sends req to a video server, failing fast while its host is remembered as down.
@@ -175,7 +186,8 @@ const (
 	headTTL   = 3 * 24 * time.Hour
 )
 
-func headFile(id int) string { return filepath.Join(cacheDir, "heads", fmt.Sprint(id)) }
+// HeadFile is where a title's probe head is saved (see saveHead).
+func HeadFile(id int) string { return filepath.Join(cacheDir, "heads", fmt.Sprint(id)) }
 
 // headCount is the number of saved heads, bounded by -probe-cache so they can't fill the disk before
 // Jellyfin's next scan probes (and removes) them.
@@ -184,7 +196,7 @@ func headCount() int {
 	return len(heads)
 }
 
-// saveHead saves an MP4's start, through its index (the moov box) plus headSlack, to headFile(id), so
+// saveHead saves an MP4's start, through its index (the moov box) plus headSlack, to HeadFile(id), so
 // Jellyfin's probe of a new title is served from disk without a stream link (stream.Read). Files with
 // the index at the end get none.
 func saveHead(id int, r io.Reader) error {
@@ -224,5 +236,27 @@ func saveHead(id int, r io.Reader) error {
 	if err := f.Close(); err != nil {
 		return err
 	}
-	return os.Rename(f.Name(), headFile(id))
+	return os.Rename(f.Name(), HeadFile(id))
+}
+
+// Reachable reports whether an artwork URL's host accepts connections (remembered per host, see hostStatus).
+// Jellyfin aborts a whole metadata refresh when an image download times out, so a dead host must not
+// end up in an NFO.
+func Reachable(uri string) bool {
+	u, err := url.Parse(uri)
+	if err != nil || u.Hostname() == "" {
+		return false
+	}
+	addr := hostPort(u)
+	if ok, known := hostStatus(addr); known {
+		return ok
+	}
+	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err == nil {
+		conn.Close()
+	}
+	if fails := hostResult(addr, err); err != nil {
+		log.Printf("artwork host %s unreachable (%d in a row), left out of NFOs: %v", addr, fails, err)
+	}
+	return err == nil
 }

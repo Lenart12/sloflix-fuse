@@ -1,4 +1,4 @@
-package main
+package sloflix
 
 import (
 	"log"
@@ -81,14 +81,14 @@ func crawlQueue(limitMovies, limitShows int) []int {
 	if err != nil {
 		log.Printf("crawl: %v", err)
 	}
-	for _, it := range firstN(movies, limitMovies) {
-		add(it.ID, parseTime(it.Created))
+	for _, it := range FirstN(movies, limitMovies) {
+		add(it.ID, it.CreatedAt())
 	}
 	shows, err := catalog(2)
 	if err != nil {
 		log.Printf("crawl: %v", err)
 	}
-	for _, show := range firstN(shows, limitShows) {
+	for _, show := range FirstN(shows, limitShows) {
 		si, err := showMeta(show.ID)
 		if err != nil {
 			log.Printf("crawl: show %d: %v", show.ID, err)
@@ -100,7 +100,7 @@ func crawlQueue(limitMovies, limitShows int) []int {
 				log.Printf("crawl: show %d season %d: %v", show.ID, s, err)
 			}
 			for _, ep := range eps {
-				add(ep.ID, parseTime(ep.Created))
+				add(ep.ID, ep.CreatedAt())
 			}
 		}
 	}

@@ -1,4 +1,4 @@
-package main
+package sloflix
 
 import (
 	"os"
@@ -16,7 +16,7 @@ func TestCachedShrinkGuard(t *testing.T) {
 	n := 10
 	get := func() int {
 		t.Helper()
-		v, err := cached("list", func() ([]item, error) { return make([]item, n), nil })
+		v, err := cached("list", func() ([]Item, error) { return make([]Item, n), nil })
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -58,14 +58,14 @@ func TestCachedPerKeyLock(t *testing.T) {
 	block, slowDone := make(chan struct{}), make(chan struct{})
 	defer func() { close(block); <-slowDone }() // don't leak the fetch into later tests
 	go func() {
-		cached("slow", func() ([]item, error) { <-block; return nil, nil })
+		cached("slow", func() ([]Item, error) { <-block; return nil, nil })
 		close(slowDone)
 	}()
 	time.Sleep(50 * time.Millisecond) // let the slow fetch take its lock
 
 	done := make(chan struct{})
 	go func() {
-		cached("fresh", func() ([]item, error) { t.Error("fresh listing refetched"); return nil, nil })
+		cached("fresh", func() ([]Item, error) { t.Error("fresh listing refetched"); return nil, nil })
 		close(done)
 	}()
 	select {
@@ -80,7 +80,7 @@ func TestCachedPerKeyLock(t *testing.T) {
 func TestWriteMetaAtomic(t *testing.T) {
 	cacheDir = t.TempDir()
 	os.MkdirAll(filepath.Join(cacheDir, "meta"), 0755)
-	writeMeta(1, meta{Size: 100 << 20, Plot: strings.Repeat("x", 4096)})
+	writeMeta(1, Meta{Size: 100 << 20, Plot: strings.Repeat("x", 4096)})
 	stop := make(chan struct{})
 	done := make(chan struct{})
 	go func() {
@@ -90,12 +90,12 @@ func TestWriteMetaAtomic(t *testing.T) {
 			case <-stop:
 				return
 			default:
-				writeMeta(1, meta{Size: 100 << 20, Plot: strings.Repeat("x", 4096)})
+				writeMeta(1, Meta{Size: 100 << 20, Plot: strings.Repeat("x", 4096)})
 			}
 		}
 	}()
 	for i := range 5000 {
-		if _, err := info(1); err != nil {
+		if _, err := Info(1); err != nil {
 			close(stop)
 			<-done
 			t.Fatalf("read %d hid the title during a rewrite", i)

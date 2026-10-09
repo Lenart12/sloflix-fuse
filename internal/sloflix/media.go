@@ -1,4 +1,4 @@
-package main
+package sloflix
 
 import (
 	"encoding/json"
@@ -19,9 +19,9 @@ type urlEntry struct {
 	at   time.Time
 }
 
-// meta is what we persist per playable item: size for getattr, subtitle for listing the .vtt.
+// Meta is what we persist per playable item: size for getattr, subtitle for listing the .vtt.
 // Size 0 means no playable source was found. Changed is when a re-resolve last saw Size or Sub differ.
-type meta struct {
+type Meta struct {
 	Size    int64     `json:"size"`
 	Sub     string    `json:"sub"`
 	Plot    string    `json:"plot"`
@@ -33,7 +33,7 @@ type meta struct {
 }
 
 // resolve fetches a fresh stream URL for id, records its size and subtitle in meta, and memoizes the URL.
-func resolve(id int, hi bool) (string, meta, error) {
+func resolve(id int, hi bool) (string, Meta, error) {
 	release := acquire(hi)
 	defer func() { release() }()
 	var d struct {
@@ -45,9 +45,9 @@ func resolve(id int, hi bool) (string, meta, error) {
 		} `json:"media_sources"`
 	}
 	if err := api(fmt.Sprintf("/media/single/%d?dont_count_view=true", id), &d, hi); err != nil {
-		return "", meta{}, err
+		return "", Meta{}, err
 	}
-	m := meta{Plot: d.Plot}
+	m := Meta{Plot: d.Plot}
 	// Prefer sloflix's own direct link; otherwise extract one from a DoodStream embed.
 	var stream, doodCode string
 	var doodSub *string
@@ -86,7 +86,7 @@ func resolve(id int, hi bool) (string, meta, error) {
 		}
 		if err != nil {
 			if !errors.Is(err, errVideoGone) {
-				return "", meta{}, err
+				return "", Meta{}, err
 			}
 			missing = fmt.Errorf("DoodStream %s: %w", doodCode, err)
 			m.DeadCode = doodCode
@@ -112,11 +112,11 @@ func resolve(id int, hi bool) (string, meta, error) {
 		if errors.Is(err, errFileGone) {
 			stream, missing = "", err
 		} else if err != nil {
-			return "", meta{}, err
+			return "", Meta{}, err
 		} else if size < minVideoSize {
 			stream, missing = "", fmt.Errorf("file is only %d bytes, likely a broken upload", size)
 			size = 0 // no source: rechecked after refreshTTL, in case it's re-uploaded
-			os.Remove(headFile(id))
+			os.Remove(HeadFile(id))
 		}
 		m.Size = size
 	}
@@ -147,7 +147,7 @@ func resolve(id int, hi bool) (string, meta, error) {
 		log.Printf("media %d changed: size %d -> %d, sub %q -> %q", id, prev.Size, m.Size, prev.Sub, m.Sub)
 		m.Changed = time.Now()
 		if prev.Size > 0 && prev.Size != m.Size {
-			os.Remove(headFile(id)) // it's from the old file
+			os.Remove(HeadFile(id)) // it's from the old file
 		}
 	}
 	writeMeta(id, m)
@@ -160,10 +160,10 @@ func resolve(id int, hi bool) (string, meta, error) {
 	return stream, m, nil
 }
 
-// info returns a title's persisted meta. Titles the crawler hasn't verified, or found without a source, are
+// Info returns a title's persisted meta. Titles the crawler hasn't verified, or found without a source, are
 // an error. A playable title stays listed through transient errors and upstream reporting it gone within
 // goneGrace (resolve keeps its size), so Jellyfin doesn't drop it and its watch history over a glitch.
-func info(id int) (meta, error) {
+func Info(id int) (Meta, error) {
 	m, _, _ := readMeta(id)
 	if m.Size < minVideoSize {
 		return m, errNoSource
@@ -175,13 +175,13 @@ func metaFile(id int) string {
 	return filepath.Join(cacheDir, "meta", fmt.Sprint(id)+".json")
 }
 
-func writeMeta(id int, m meta) {
+func writeMeta(id int, m Meta) {
 	b, _ := json.Marshal(m)
 	writeFile(metaFile(id), b)
 }
 
-func readMeta(id int) (meta, time.Time, bool) {
-	var m meta
+func readMeta(id int) (Meta, time.Time, bool) {
+	var m Meta
 	st, err := os.Stat(metaFile(id))
 	if err != nil {
 		return m, time.Time{}, false
@@ -190,13 +190,13 @@ func readMeta(id int) (meta, time.Time, bool) {
 	return m, st.ModTime(), json.Unmarshal(b, &m) == nil
 }
 
-// setSize records a size seen by a stream that differs from the cached one: the upstream file was replaced.
-func setSize(id int, size int64) {
+// SetSize records a size seen by a stream that differs from the cached one: the upstream file was replaced.
+func SetSize(id int, size int64) {
 	m, _, _ := readMeta(id)
 	log.Printf("media %d changed: size %d -> %d", id, m.Size, size)
 	m.Size, m.Changed = size, time.Now()
 	writeMeta(id, m)
-	os.Remove(headFile(id)) // it's from the old file
+	os.Remove(HeadFile(id)) // it's from the old file
 	urlMu.Lock()
 	if e, ok := urls[id]; ok {
 		e.size = size
@@ -205,9 +205,9 @@ func setSize(id int, size int64) {
 	urlMu.Unlock()
 }
 
-// streamURL returns a memoized stream URL and its size, or fresh ones if force is set or it is older than urlTTL.
+// StreamURL returns a memoized stream URL and its size, or fresh ones if force is set or it is older than urlTTL.
 // Resolving also refreshes the item's persisted meta, so opening a file revalidates its size and subtitle.
-func streamURL(id int, force bool) (string, int64, error) {
+func StreamURL(id int, force bool) (string, int64, error) {
 	urlMu.Lock()
 	e, ok := urls[id]
 	urlMu.Unlock()

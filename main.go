@@ -1,3 +1,4 @@
+// Command sloflixfs mounts the sloflix.com catalog as a read-only FUSE filesystem in Jellyfin's layout.
 package main
 
 import (
@@ -7,46 +8,41 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"slices"
 	"syscall"
 	"time"
 
 	"github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
+
+	"github.com/Lenart12/sloflixfs/internal/fusefs"
+	"github.com/Lenart12/sloflixfs/internal/sloflix"
 )
 
 func main() {
 	userCache, _ := os.UserCacheDir()
+	var cfg sloflix.Config
 	mount := flag.String("mount", "", "mountpoint (required)")
-	flag.StringVar(&cacheDir, "cache", filepath.Join(userCache, "sloflixfs"), "cache directory")
-	flag.DurationVar(&refreshTTL, "refresh", 12*time.Hour, "how long catalog listings are cached")
-	flag.DurationVar(&metaTTL, "revalidate", 7*24*time.Hour, "how often each title's size and subtitle are revalidated in the background")
-	flag.IntVar(&probeCache, "probe-cache", 500, "max new titles whose start is saved for Jellyfin's first probe, about 10-16 MB each until probed (0 = off)")
-	rate := flag.Float64("rate", 1, "max API requests per second")
-	concurrency := flag.Int("concurrency", 3, "max upstream lookups/fetches in flight (playback is exempt)")
+	flag.StringVar(&cfg.CacheDir, "cache", filepath.Join(userCache, "sloflixfs"), "cache directory")
+	flag.DurationVar(&cfg.Refresh, "refresh", 12*time.Hour, "how long catalog listings are cached")
+	flag.DurationVar(&cfg.Revalidate, "revalidate", 7*24*time.Hour, "how often each title's size and subtitle are revalidated in the background")
+	flag.IntVar(&cfg.ProbeCache, "probe-cache", 500, "max new titles whose start is saved for Jellyfin's first probe, about 10-16 MB each until probed (0 = off)")
+	flag.Float64Var(&cfg.Rate, "rate", 1, "max API requests per second")
+	flag.IntVar(&cfg.Concurrency, "concurrency", 3, "max upstream lookups/fetches in flight (playback is exempt)")
 	limitMovies := flag.Int("limit-movies", 0, "list only the newest N movies (0 = all), for testing")
 	limitShows := flag.Int("limit-shows", 0, "list only the newest N shows (0 = all), for testing")
 	allowOther := flag.Bool("allow-other", false, "let other users (e.g. Jellyfin in Docker) access the mount")
 	flag.Parse()
-	username, password = os.Getenv("SLOFLIX_USER"), os.Getenv("SLOFLIX_PASS")
-	if *mount == "" || username == "" || password == "" {
+	cfg.Username, cfg.Password = os.Getenv("SLOFLIX_USER"), os.Getenv("SLOFLIX_PASS")
+	if *mount == "" || cfg.Username == "" || cfg.Password == "" {
 		log.Fatal("usage: SLOFLIX_USER=.. SLOFLIX_PASS=.. sloflixfs -mount DIR")
 	}
-	if *rate <= 0 || *concurrency <= 0 {
+	if cfg.Rate <= 0 || cfg.Concurrency <= 0 {
 		log.Fatal("-rate and -concurrency must be positive")
 	}
-	slots = make(chan struct{}, *concurrency)
-	go throttleLoop(time.Duration(float64(time.Second) / *rate), hiQ, loQ)
-	// A previous run (just restarted) may have used DoodStream's limit: count the crawler's share as used,
-	// so it waits a window while playback keeps its reserve.
-	doodSent = slices.Repeat([]time.Time{time.Now()}, doodMax-doodReserve)
-	for _, d := range []string{"json", "meta", "subs", "heads"} {
-		if err := os.MkdirAll(filepath.Join(cacheDir, d), 0755); err != nil {
-			log.Fatal(err)
-		}
+	if err := sloflix.Start(cfg); err != nil {
+		log.Fatal(err)
 	}
-	// Fail fast on bad credentials instead of retrying the login on every filesystem operation.
-	if _, err := login(false); err != nil {
+	if err := sloflix.Login(); err != nil {
 		log.Fatal(err)
 	}
 
@@ -58,7 +54,7 @@ func main() {
 		log.Fatal(err)
 	}
 	timeout := time.Hour
-	server, err := fs.Mount(*mount, newRoot(*limitMovies, *limitShows), &fs.Options{
+	server, err := fs.Mount(*mount, fusefs.NewRoot(*limitMovies, *limitShows), &fs.Options{
 		EntryTimeout: &timeout,
 		AttrTimeout:  &timeout,
 		MountOptions: fuse.MountOptions{
@@ -76,7 +72,7 @@ func main() {
 		log.Fatal(err)
 	}
 	log.Printf("mounted on %s", *mount)
-	go crawler(*limitMovies, *limitShows)
+	go sloflix.Crawl(*limitMovies, *limitShows)
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
