@@ -2,19 +2,10 @@ package main
 
 import (
 	"context"
-	"encoding/base64"
-	"encoding/xml"
-	"errors"
 	"fmt"
-	"io"
 	"log"
-	"net"
-	"net/http"
-	"net/url"
 	"os"
-	"strconv"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 	"unicode"
@@ -22,13 +13,6 @@ import (
 	"github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
 )
-
-// Forward gaps up to this size are read and discarded instead of opening a new connection.
-const skipMax = 1 << 20
-
-// readTimeout bounds one read from the CDN. A stalled connection is closed and reopened instead of hanging
-// the read (and Release, which waits for it) until TCP gives up.
-var readTimeout = 30 * time.Second
 
 var startTime = time.Now()
 
@@ -171,145 +155,6 @@ func mtimeOf(created time.Time, m meta) time.Time {
 	return created
 }
 
-// stream serves reads from a single HTTP Range response, reopening it only on seeks.
-type stream struct {
-	id      int
-	mu      sync.Mutex
-	size    int64
-	resolve func(force bool) (string, error)
-	resized func(size int64) // called when the first response shows the upstream file has a new size
-	served  bool             // data was already returned, so a size change would splice two files
-	body    io.ReadCloser
-	pos     int64
-	head    *os.File // the file's start, if cached for Jellyfin's probe (saveHead); removed on close
-	headLen int64
-
-	conns  int   // connections opened, for the summary logged on close
-	read   int64 // bytes downloaded, including skipped gaps
-	cached int64 // bytes served from head
-	opened time.Time
-}
-
-func (s *stream) close() {
-	if s.body != nil {
-		s.body.Close()
-		s.body = nil
-	}
-}
-
-func (s *stream) open(off int64) error {
-	s.close()
-	for attempt := 0; attempt < 2; attempt++ {
-		u, err := s.resolve(attempt > 0)
-		if err != nil {
-			return err
-		}
-		req, err := newRequest(context.Background(), "GET", u, nil)
-		if err != nil {
-			return err
-		}
-		req.Header.Set("Referer", referer)
-		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", off))
-		resp, err := cdnDo(req)
-		if err != nil {
-			log.Printf("stream: %v", err)
-			continue
-		}
-		if resp.StatusCode == http.StatusPartialContent {
-			_, total, _ := strings.Cut(resp.Header.Get("Content-Range"), "/")
-			if size, _ := strconv.ParseInt(total, 10, 64); size > 0 && size != s.size {
-				if s.served {
-					resp.Body.Close()
-					return fmt.Errorf("upstream file changed from %d to %d bytes while open", s.size, size)
-				}
-				s.size = size
-				if s.head != nil { // it's the old file's start (resized removes the file)
-					s.head.Close()
-					s.head = nil
-				}
-				if s.resized != nil {
-					s.resized(size)
-				}
-			}
-			s.body, s.pos = resp.Body, off
-			s.conns++
-			return nil
-		}
-		resp.Body.Close()
-		log.Printf("stream: %s, re-resolving", resp.Status)
-	}
-	return errors.New("stream unavailable")
-}
-
-func (s *stream) Read(ctx context.Context, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	// Reads must be whole (a short read means EOF), so only those entirely within head are served from it.
-	if n := min(int64(len(dest)), s.size-off); s.head != nil && n > 0 && off+n <= s.headLen {
-		if got, _ := s.head.ReadAt(dest[:n], off); got == int(n) {
-			s.served = true
-			s.cached += n
-			return fuse.ReadResultData(dest[:n]), 0
-		}
-	}
-	buf := dest
-	for attempt := 0; attempt < 2; attempt++ {
-		if off >= s.size {
-			return fuse.ReadResultData(nil), 0
-		}
-		if s.body == nil || off < s.pos || off-s.pos > skipMax {
-			if err := s.open(off); err != nil {
-				log.Printf("stream: %v", err)
-				return nil, syscall.EIO
-			}
-			if off >= s.size { // the first response may have shown a smaller file
-				return fuse.ReadResultData(nil), 0
-			}
-		} else if off > s.pos {
-			if err := s.withDeadline(func(r io.Reader) error { n, err := io.CopyN(io.Discard, r, off-s.pos); s.read += n; return err }); err != nil {
-				s.close()
-				continue
-			}
-			s.pos = off
-		}
-		dest := buf[:min(int64(len(buf)), s.size-off)]
-		var n int
-		err := s.withDeadline(func(r io.Reader) (err error) { n, err = io.ReadFull(r, dest); return err })
-		s.pos += int64(n)
-		s.read += int64(n)
-		if err == nil {
-			s.served = true
-			return fuse.ReadResultData(dest), 0
-		}
-		log.Printf("stream: read at %d: %v", off, err)
-		s.close()
-	}
-	return nil, syscall.EIO
-}
-
-// withDeadline runs fn on the open body, closing the body if fn takes longer than readTimeout.
-func (s *stream) withDeadline(fn func(io.Reader) error) error {
-	body := s.body
-	t := time.AfterFunc(readTimeout, func() { body.Close() })
-	defer t.Stop()
-	return fn(body)
-}
-
-func (s *stream) Release(ctx context.Context) syscall.Errno {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.close()
-	if s.head != nil {
-		// Jellyfin probes a file once; later opens stream it.
-		s.head.Close()
-		os.Remove(headFile(s.id))
-	}
-	if s.conns > 0 || s.cached > 0 {
-		log.Printf("close %d: %d connections, %.1f MB in %v, %.1f MB from probe cache", s.id, s.conns, float64(s.read)/1e6, time.Since(s.opened).Round(100*time.Millisecond), float64(s.cached)/1e6)
-	}
-	return 0
-}
-
 func subtitleNode(loc string, mtime time.Time) func() (fs.InodeEmbedder, error) {
 	return func() (fs.InodeEmbedder, error) {
 		b, err := subtitle(loc)
@@ -359,97 +204,6 @@ func title(it item) string {
 		return fmt.Sprintf("%s (%d)", name(it), it.Year)
 	}
 	return name(it)
-}
-
-type nfoThumb struct {
-	Aspect string `xml:"aspect,attr,omitempty"`
-	URL    string `xml:",chardata"`
-}
-
-// dataImage turns a "data:image/<type>;base64,..." URI into a sidecar image file named base.<type>.
-func dataImage(uri, base string, mtime time.Time) (child, bool) {
-	typ, data, ok := strings.Cut(strings.TrimPrefix(uri, "data:image/"), ";base64,")
-	if !ok || len(typ) == len(uri) {
-		return child{}, false
-	}
-	b, err := base64.StdEncoding.DecodeString(data)
-	if err != nil {
-		return child{}, false
-	}
-	return child{name: base + "." + strings.Replace(typ, "jpeg", "jpg", 1), node: func() (fs.InodeEmbedder, error) {
-		f := &fs.MemRegularFile{Data: b}
-		f.Attr.Mode = 0444
-		f.Attr.SetTimes(nil, &mtime, &mtime)
-		return f, nil
-	}}, true
-}
-
-// reachable reports whether an artwork URL's host accepts connections (remembered per host, see hostStatus).
-// Jellyfin aborts a whole metadata refresh when an image download times out, so a dead host must not
-// end up in an NFO.
-func reachable(uri string) bool {
-	u, err := url.Parse(uri)
-	if err != nil || u.Hostname() == "" {
-		return false
-	}
-	addr := hostPort(u)
-	if ok, known := hostStatus(addr); known {
-		return ok
-	}
-	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
-	if err == nil {
-		conn.Close()
-	}
-	if fails := hostResult(addr, err); err != nil {
-		log.Printf("artwork host %s unreachable (%d in a row), left out of NFOs: %v", addr, fails, err)
-	}
-	return err == nil
-}
-
-// nfoChild renders sloflix's metadata as a Jellyfin/Kodi NFO, so titles TMDB can't match still get a plot,
-// genres and artwork. Jellyfin downloads http(s) image URLs itself; images sloflix embeds as data: URIs (which
-// Jellyfin rejects in an NFO) become poster/fanart sidecar files instead.
-func nfoChild(file, root string, it item, plot string, mtime time.Time) []child {
-	// Title in Slovenian, as on sloflix. No originaltitle: sloflix only knows the Slovenian and English names,
-	// not the original-language one, so it's left for TMDB to fill when Jellyfin matches the item.
-	n := struct {
-		XMLName xml.Name
-		Title   string     `xml:"title"`
-		Year    int        `xml:"year,omitempty"`
-		Plot    string     `xml:"plot,omitempty"`
-		Genres  []string   `xml:"genre"`
-		Poster  *nfoThumb  `xml:"thumb,omitempty"`
-		Fanart  []nfoThumb `xml:"fanart>thumb,omitempty"`
-	}{XMLName: xml.Name{Local: root}, Title: clean(it.Name), Year: it.Year, Plot: plot, Genres: it.Genres}
-	var out []child
-	art := func(uri, base string) string {
-		if strings.HasPrefix(uri, "http") {
-			if !reachable(uri) {
-				return ""
-			}
-			return uri
-		}
-		if c, ok := dataImage(uri, base, mtime); ok {
-			out = append(out, c)
-		}
-		return ""
-	}
-	if u := art(it.Poster, "poster"); u != "" {
-		n.Poster = &nfoThumb{Aspect: "poster", URL: u}
-	}
-	if u := art(it.Banner, "fanart"); u != "" {
-		n.Fanart = []nfoThumb{{URL: u}}
-	}
-	return append(out, child{name: file, node: func() (fs.InodeEmbedder, error) {
-		b, err := xml.MarshalIndent(n, "", "  ")
-		if err != nil {
-			return nil, err
-		}
-		f := &fs.MemRegularFile{Data: append([]byte(xml.Header), b...)}
-		f.Attr.Mode = 0444
-		f.Attr.SetTimes(nil, &mtime, &mtime)
-		return f, nil
-	}})
 }
 
 // uniq returns name, or name with " [id]" appended if it was already taken.
