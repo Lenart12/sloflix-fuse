@@ -112,6 +112,7 @@ The first time a title is listed costs one API call plus a 1-byte range request 
 - DoodStream sometimes answers embed links with a captcha (Cloudflare Turnstile) instead of the player; one episode lasted about 10 minutes. sloflixfs doesn't try to get past it: the lookup fails as a temporary error (logged as `asks for a captcha`) and is retried later. Titles with only an embed link (about 30% of the catalog) can't be played or newly listed meanwhile; titles that were already listed stay listed.
 - Titles that were never playable and whose CDN host is unreachable are hidden and retried hourly. Titles that were playable stay listed through such errors, and are only hidden once upstream has reported them gone for 24 hours.
 - Sloflix only provides Slovenian and English titles. NFO files set the Slovenian title; the original-language title comes from TMDB when Jellyfin can match the item.
+- Some of DoodStream's video servers still serve files under a `*.cloudatacdn.com` certificate that expired on 2026-08-01. sloflixfs accepts an expired certificate for that domain only, and only if its chain and hostname verify as of its expiry date; every other host gets normal verification. Each accepted host is logged once.
 - Requests send a browser User-Agent to pass Cloudflare. Stricter bot protection on sloflix's side would stop the mount from working.
 
 ## Development

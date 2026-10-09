@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -163,7 +165,46 @@ func cdnTransport() *http.Transport {
 	t.ResponseHeaderTimeout = 30 * time.Second
 	// Healthy video servers connect in ~100ms; a dead one shouldn't hold a lookup for long.
 	t.DialContext = (&net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}).DialContext
+	// Go's own verification would reject expired certificates before VerifyConnection runs, so it's
+	// skipped and verifyCert does the full verification itself.
+	t.TLSClientConfig = &tls.Config{
+		InsecureSkipVerify: true,
+		VerifyConnection:   func(cs tls.ConnectionState) error { return verifyCert(cs, nil) },
+	}
 	return t
+}
+
+// expiredOK is the only domain whose expired certificates are accepted: some DoodStream video servers
+// still serve files under a *.cloudatacdn.com certificate that expired on 2026-08-01.
+const expiredOK = ".cloudatacdn.com"
+
+var expiredSeen sync.Map // host -> struct{}, to log each accepted expired certificate once
+
+// verifyCert verifies the server's chain and hostname against roots (nil: the system's). For hosts under
+// expiredOK, an expired certificate is accepted if it verifies as of its own expiry: same chain and
+// hostname checks, only the expiry is waived.
+func verifyCert(cs tls.ConnectionState, roots *x509.CertPool) error {
+	if len(cs.PeerCertificates) == 0 {
+		return errors.New("tls: no server certificate")
+	}
+	leaf := cs.PeerCertificates[0]
+	opts := x509.VerifyOptions{DNSName: cs.ServerName, Roots: roots, Intermediates: x509.NewCertPool()}
+	for _, c := range cs.PeerCertificates[1:] {
+		opts.Intermediates.AddCert(c)
+	}
+	_, err := leaf.Verify(opts)
+	var invalid x509.CertificateInvalidError
+	if err == nil || !strings.HasSuffix(cs.ServerName, expiredOK) || !errors.As(err, &invalid) || invalid.Reason != x509.Expired {
+		return err
+	}
+	opts.CurrentTime = leaf.NotAfter
+	if _, err := leaf.Verify(opts); err != nil {
+		return err
+	}
+	if _, seen := expiredSeen.LoadOrStore(cs.ServerName, struct{}{}); !seen {
+		log.Printf("cdn: accepting expired certificate of %s (expired %s)", cs.ServerName, leaf.NotAfter.Format(time.DateOnly))
+	}
+	return nil
 }
 
 // cdnDo sends req to a video server, failing fast while its host is remembered as down.
