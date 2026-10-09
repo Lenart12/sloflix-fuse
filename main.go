@@ -35,12 +35,18 @@ func main() {
 	allowOther := flag.Bool("allow-other", false, "let other users (e.g. Jellyfin in Docker) access the mount")
 	flag.StringVar(&cfg.Username, "user", "", "sloflix username")
 	flag.StringVar(&cfg.Password, "pass", "", "sloflix password; prefer the environment variable, since other users can see arguments")
+	flag.StringVar(&cfg.JellyfinURL, "jellyfin-url", "", "Jellyfin's address (e.g. http://jellyfin:8096), to scan its sloflix libraries when new titles are ready (empty = off)")
+	flag.StringVar(&cfg.JellyfinKey, "jellyfin-key", "", "Jellyfin API key (Dashboard > API Keys)")
+	flag.StringVar(&cfg.JellyfinPath, "jellyfin-path", "/media/sloflix/library", "the mount's path as Jellyfin sees it; libraries under it are scanned")
 	if err := envDefaults(flag.CommandLine, os.Getenv); err != nil {
 		log.Fatal(err)
 	}
 	flag.Parse()
 	if *mount == "" || cfg.Username == "" || cfg.Password == "" {
 		log.Fatal("usage: sloflixfs -mount DIR, with credentials in SLOFLIX_USER and SLOFLIX_PASS (or -user, -pass); -h lists all options")
+	}
+	if cfg.JellyfinURL != "" && cfg.JellyfinKey == "" {
+		log.Fatal("-jellyfin-url needs -jellyfin-key")
 	}
 	if cfg.Rate <= 0 || cfg.Concurrency <= 0 {
 		log.Fatal("-rate and -concurrency must be positive")

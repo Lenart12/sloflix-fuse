@@ -18,12 +18,16 @@ type Config struct {
 	Rate               float64       // max sloflix API requests per second
 	Concurrency        int           // max upstream lookups and fetches in flight; playback is exempt
 	Username, Password string
+	JellyfinURL        string // if set, scan the libraries under JellyfinPath when new titles are verified
+	JellyfinKey        string
+	JellyfinPath       string // the mount as Jellyfin sees it
 }
 
 // Start applies cfg, creates the cache directories and starts the API rate limiter. It doesn't log in.
 func Start(cfg Config) error {
 	cacheDir, refreshTTL, metaTTL, probeCache = cfg.CacheDir, cfg.Refresh, cfg.Revalidate, cfg.ProbeCache
 	username, password = cfg.Username, cfg.Password
+	jfURL, jfKey, jfPath = cfg.JellyfinURL, cfg.JellyfinKey, cfg.JellyfinPath
 	slots = make(chan struct{}, cfg.Concurrency)
 	go throttleLoop(time.Duration(float64(time.Second)/cfg.Rate), hiQ, loQ)
 	// A previous run (just restarted) may have used DoodStream's limit: count the crawler's share as used,

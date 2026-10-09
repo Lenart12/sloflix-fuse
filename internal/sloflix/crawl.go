@@ -129,6 +129,9 @@ func crawlQueue(limitMovies, limitShows int) []int {
 	if len(ids) > 0 {
 		log.Printf("crawl: %d new, %d to recheck; %d of %d probe cache slots used", fresh, len(ids)-fresh, headCount(), probeCache)
 	}
+	if fresh == 0 {
+		go jellyfinScan()
+	}
 	return ids
 }
 
@@ -137,7 +140,13 @@ func crawl(id int) {
 	if _, _, ok := due(id); !ok {
 		return
 	}
+	_, listed := Info(id)
 	_, m, err := resolve(id, false)
+	if err == nil && listed != nil {
+		if _, err := Info(id); err == nil {
+			jfVerified()
+		}
+	}
 	if err != nil {
 		lookupMu.Lock()
 		crawlFailed[id] = time.Now() // transient errors aren't persisted; don't retry for failTTL

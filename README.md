@@ -57,6 +57,8 @@ In each library's settings, **disable** these, since they read whole files from 
 - Chapter image extraction
 - Real-time monitoring
 
+To have sloflixfs start a scan when new titles appear, create an API key in Jellyfin (Dashboard → API Keys), set `SLOFLIX_JELLYFIN_URL=http://jellyfin:8096` and `SLOFLIX_JELLYFIN_KEY` in `.env`, and uncomment both in compose.yml.
+
 For a first try, set `SLOFLIX_LIMIT_MOVIES=20` and `SLOFLIX_LIMIT_SHOWS=2` in `.env` (and uncomment both in compose.yml) to list only the newest titles.
 
 ### How the Docker setup works
@@ -86,9 +88,12 @@ Every option is a flag or an environment variable: `SLOFLIX_` plus the flag name
 | `-cache` | `SLOFLIX_CACHE` | `~/.cache/sloflixfs` | Cache directory (`/cache` in Docker). |
 | `-refresh` | `SLOFLIX_REFRESH` | `12h` | How long catalog, season and episode listings are cached. |
 | `-revalidate` | `SLOFLIX_REVALIDATE` | `168h` | How often each title's size and subtitle are re-checked in the background. |
-| `-probe-cache` | `SLOFLIX_PROBE_CACHE` | `500` | Max new titles whose start is saved so Jellyfin's first probe needs no stream lookup (about 10–16 MB each, deleted once probed; 500 is up to about 8 GB). Beyond it, and with `0`, probes stream as usual. |
+| `-probe-cache` | `SLOFLIX_PROBE_CACHE` | `500` | Max new titles whose start is saved so Jellyfin's first probe needs no stream lookup (about 10–16 MB each, deleted once probed; 500 is up to about 8 GB). Beyond it, and with `0`, probes stream as usual: free within 4h of the crawler checking the title (it keeps the stream link), otherwise a stream lookup. For titles with only a DoodStream embed that's a DoodStream lookup, so a scan probing more than about 15 of them in 5 minutes has the rest wait up to a minute and then fail (Jellyfin retries on a later scan). Opens aren't limited by `-concurrency`. |
 | `-rate` | `SLOFLIX_RATE` | `1` | Max API requests per second. |
 | `-concurrency` | `SLOFLIX_CONCURRENCY` | `3` | Max upstream lookups/fetches in flight (playback is exempt). |
+| `-jellyfin-url` | `SLOFLIX_JELLYFIN_URL` | (off) | Jellyfin's address, e.g. `http://jellyfin:8096`. When set, sloflixfs starts a scan of its libraries when new titles are ready (see below). |
+| `-jellyfin-key` | `SLOFLIX_JELLYFIN_KEY` | | Jellyfin API key (Dashboard → API Keys). |
+| `-jellyfin-path` | `SLOFLIX_JELLYFIN_PATH` | `/media/sloflix/library` | The mount's path as Jellyfin sees it; the libraries under it are the ones scanned. |
 | `-allow-other` | `SLOFLIX_ALLOW_OTHER` | `false` | Allow other users to access the mount. |
 | `-limit-movies`, `-limit-shows` | `SLOFLIX_LIMIT_MOVIES`, `SLOFLIX_LIMIT_SHOWS` | `0` (all) | List and crawl only the newest N titles; for testing. |
 | `-user`, `-pass` | `SLOFLIX_USER`, `SLOFLIX_PASS` | (required) | sloflix credentials. Prefer the environment for the password, since other users can see command-line arguments. |
@@ -107,7 +112,7 @@ With Docker Compose, set options in `.env` (e.g. `SLOFLIX_PROBE_CACHE=1000`); un
 | Stream URLs | memory | after 4h, or when the CDN rejects one |
 | Video data | not cached | |
 
-A title appears once the crawler has checked it: one API call, a CDN request for the file size and the start of the file, and, for titles with only a DoodStream embed link, a DoodStream lookup. With an empty cache the library fills in over a few days, newest titles first, because DoodStream lookups are limited to one per 26 seconds (see Limitations). Jellyfin's scheduled scans pick up whatever has appeared since the last one. Opening a file costs one API call (cached for 4 hours) and then streams; Jellyfin's first probe of a new title is served from the saved start instead. API, DoodStream and size requests are logged one per line, and each closed file logs a summary of its stream connections, so `docker compose logs -f sloflix` shows what the cache is doing.
+A title appears once the crawler has checked it: one API call, a CDN request for the file size and the start of the file, and, for titles with only a DoodStream embed link, a DoodStream lookup. With an empty cache the library fills in over a few days, newest titles first, because DoodStream lookups are limited to one per 26 seconds (see Limitations). Jellyfin's scheduled scans pick up whatever has appeared since the last one; Jellyfin can't watch the mount for changes (FUSE has no change notifications). With `-jellyfin-url` set, sloflixfs instead starts a scan of the libraries under `-jellyfin-path` itself once new titles are ready: when the probe cache is half full, so new titles keep getting a saved start, or when no new titles are left to check. It skips the scan while Jellyfin is already scanning, and starts at most one an hour. Opening a file costs one API call (cached for 4 hours) and then streams; Jellyfin's first probe of a new title is served from the saved start instead. API, DoodStream and size requests are logged one per line, and each closed file logs a summary of its stream connections, so `docker compose logs -f sloflix` shows what the cache is doing.
 
 ## Limitations
 
@@ -136,7 +141,7 @@ docker buildx build --platform linux/amd64,linux/arm64 -t lenart12/sloflixfs:X.Y
 Layout:
 
 - `main.go`: flags (each also read from its `SLOFLIX_*` environment variable), mounting and shutdown.
-- `internal/sloflix`: the upstream side. The sloflix API and listing cache (`api.go`), per-title metadata and stream links (`media.go`), the background crawler (`crawl.go`), rate limits and the DoodStream window (`limits.go`), the CDN, size probes and probe heads (`cdn.go`), DoodStream embeds (`dood.go`), and setup (`sloflix.go`).
+- `internal/sloflix`: the upstream side. The sloflix API and listing cache (`api.go`), per-title metadata and stream links (`media.go`), the background crawler (`crawl.go`), rate limits and the DoodStream window (`limits.go`), the CDN, size probes and probe heads (`cdn.go`), DoodStream embeds (`dood.go`), Jellyfin scan triggers (`jellyfin.go`), and setup (`sloflix.go`).
 - `internal/fusefs`: the filesystem. The tree and listings (`fs.go`), the streaming file handle (`stream.go`), and NFO files (`nfo.go`).
 
 ## License
