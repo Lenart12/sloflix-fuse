@@ -24,6 +24,8 @@ func TestDoodURL(t *testing.T) {
 			w.Write([]byte(`<title>Video not found | DoodStream</title>`))
 		case "/e/challenge":
 			w.Write([]byte(`<title>Just a moment...</title>`))
+		case "/e/captcha":
+			w.Write([]byte(`<title>X - DoodStream.com</title><script src="//challenges.cloudflare.com/turnstile/v0/api.js"></script>`))
 		case "/pass_md5/123-abc/tok42":
 			if r.Referer() != srv.URL+"/e/good" {
 				t.Errorf("pass_md5 referer %q", r.Referer())
@@ -48,6 +50,10 @@ func TestDoodURL(t *testing.T) {
 	}
 	if _, err := doodURL("challenge"); err == nil || errors.Is(err, errVideoGone) {
 		t.Fatalf("challenge page should be a transient error, got %v", err)
+	}
+
+	if _, err := doodURL("captcha"); err == nil || errors.Is(err, errVideoGone) || !strings.Contains(err.Error(), "captcha") {
+		t.Fatalf("captcha should be a transient captcha error, got %v", err)
 	}
 }
 

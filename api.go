@@ -554,6 +554,9 @@ func doodURL(code string) (string, error) {
 		if strings.Contains(strings.ToLower(title), "video not found") {
 			return "", errVideoGone
 		}
+		if bytes.Contains(page, []byte("turnstile")) {
+			return "", fmt.Errorf("doodstream %s: asks for a captcha (Turnstile)", code)
+		}
 		return "", fmt.Errorf("doodstream %s: no pass_md5 in page (title %q)", code, title)
 	}
 	embed := resp.Request.URL // after the mirror's redirect
