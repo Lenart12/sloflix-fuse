@@ -102,7 +102,9 @@ type video struct {
 func (v *video) Getattr(ctx context.Context, f fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
 	m, err := info(v.id)
 	if err != nil {
-		log.Printf("getattr %d: %v", v.id, err)
+		if !quiet(err) {
+			log.Printf("getattr %d: %v", v.id, err)
+		}
 		return syscall.EIO
 	}
 	mtime := mtimeOf(v.mtime, m)
@@ -116,7 +118,9 @@ func (v *video) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, 
 	log.Printf("open %d: %s", v.id, v.Path(nil))
 	_, size, err := streamURL(v.id, false)
 	if err != nil {
-		log.Printf("open %d: %v", v.id, err)
+		if !quiet(err) {
+			log.Printf("open %d: %v", v.id, err)
+		}
 		return nil, 0, syscall.EIO
 	}
 	return &stream{
@@ -434,7 +438,9 @@ func uniq(seen map[string]bool, name string, id int) string {
 func mediaFiles(id int, base string, mtime time.Time) []child {
 	m, err := info(id)
 	if err != nil {
-		log.Printf("media %d: %v", id, err)
+		if !quiet(err) {
+			log.Printf("media %d: %v", id, err)
+		}
 		return nil
 	}
 	out := []child{{name: base + ".mp4", node: func() (fs.InodeEmbedder, error) { return &video{id: id, mtime: mtime}, nil }}}

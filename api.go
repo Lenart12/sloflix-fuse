@@ -21,8 +21,9 @@ import (
 	"time"
 )
 
+var apiBase = "https://api.sloflix.com/v1" // a var for tests
+
 const (
-	apiBase   = "https://api.sloflix.com/v1"
 	subBase   = "https://sloflix.com/subtitles/"
 	userAgent = "Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0"
 	referer   = "https://player.sloflix.com/"
@@ -31,7 +32,20 @@ const (
 	// A listing that shrinks by more than 10% is treated as an upstream glitch, so Jellyfin doesn't delete
 	// the missing titles. Only a shrink that persists this long is accepted.
 	shrinkAccept = 24 * time.Hour
+	// A title that used to play stays listed this long after upstream first says it's gone, so one wrong
+	// "gone" (an anti-bot page, a CDN hiccup) can't make Jellyfin drop it and its watch history.
+	goneGrace = 24 * time.Hour
+	// Playback failures are remembered this long, so a probe retrying a dead title doesn't refetch each time.
+	playFailTTL = 5 * time.Minute
 )
+
+// Outcomes that were logged when first determined; callers don't log them again on every listing.
+var (
+	errNoSource       = errors.New("no direct source")
+	errFailedRecently = errors.New("lookup failed recently")
+)
+
+func quiet(err error) bool { return errors.Is(err, errNoSource) || errors.Is(err, errFailedRecently) }
 
 var (
 	cacheDir   string
@@ -130,6 +144,7 @@ type meta struct {
 	Sub     string    `json:"sub"`
 	Plot    string    `json:"plot"`
 	Changed time.Time `json:"changed"`
+	Gone    time.Time `json:"gone,omitzero"` // when upstream first reported a listed title gone (see goneGrace)
 }
 
 type showInfo struct {
@@ -397,7 +412,7 @@ func resolve(id int, hi bool) (string, meta, error) {
 		var err error
 		if stream, err = doodURL(doodCode); err != nil {
 			if !errors.Is(err, errVideoGone) {
-				return "", meta{}, fmt.Errorf("media %d: %w", id, err)
+				return "", meta{}, err
 			}
 			missing = fmt.Errorf("DoodStream %s: %w", doodCode, err)
 		}
@@ -405,7 +420,8 @@ func resolve(id int, hi bool) (string, meta, error) {
 			m.Sub = *doodSub
 		}
 	}
-	if prev, _, ok := readMeta(id); stream != "" && hi && ok && prev.Size > 0 {
+	prev, _, hasPrev := readMeta(id)
+	if stream != "" && hi && prev.Size > 0 {
 		// Playback skips the size probe: the stream checks the size on every response (stream.open).
 		m.Size = prev.Size
 	} else if stream != "" {
@@ -413,28 +429,40 @@ func resolve(id int, hi bool) (string, meta, error) {
 		if errors.Is(err, errFileGone) {
 			stream, missing = "", err
 		} else if err != nil {
-			return "", meta{}, fmt.Errorf("media %d: %w", id, err)
+			return "", meta{}, err
 		}
 		m.Size = size
 	}
-	if prev, _, ok := readMeta(id); ok {
-		m.Changed = prev.Changed
-		if prev.Size != m.Size || prev.Sub != m.Sub {
-			log.Printf("media %d changed: size %d -> %d, sub %q -> %q", id, prev.Size, m.Size, prev.Sub, m.Sub)
-			m.Changed = time.Now()
-		}
-	}
-	writeMeta(id, m)
+	var noSource error
 	if stream == "" && missing != nil {
-		return "", m, fmt.Errorf("media %d: no direct source: %w", id, missing)
-	}
-	if stream == "" {
+		noSource = fmt.Errorf("no direct source: %w", missing)
+	} else if stream == "" {
 		var got []string
 		for _, s := range d.Sources {
 			u, _ := url.Parse(s.Source)
 			got = append(got, fmt.Sprintf("%s@%s", s.Name, u.Host))
 		}
-		return "", m, fmt.Errorf("media %d: no direct source (got %d: %v)", id, len(d.Sources), got)
+		noSource = fmt.Errorf("no direct source (got %d: %v)", len(d.Sources), got)
+	}
+	m.Changed = prev.Changed
+	if noSource != nil && prev.Size > 0 {
+		gone := prev.Gone
+		if gone.IsZero() {
+			gone = time.Now()
+		}
+		if time.Since(gone) < goneGrace {
+			m.Size, m.Gone = prev.Size, gone
+			writeMeta(id, m)
+			return "", m, fmt.Errorf("%w; still listed until %s", noSource, gone.Add(goneGrace).Format(time.DateTime))
+		}
+	}
+	if hasPrev && (prev.Size != m.Size || prev.Sub != m.Sub) {
+		log.Printf("media %d changed: size %d -> %d, sub %q -> %q", id, prev.Size, m.Size, prev.Sub, m.Sub)
+		m.Changed = time.Now()
+	}
+	writeMeta(id, m)
+	if noSource != nil {
+		return "", m, noSource
 	}
 	urlMu.Lock()
 	urls[id] = urlEntry{stream, m.Size, time.Now()}
@@ -557,13 +585,13 @@ func info(id int) (meta, error) {
 		if m, ok := knownMeta(id); ok {
 			return withSize(id, m)
 		}
-		return meta{}, fmt.Errorf("media %d: lookup failed", id)
+		return meta{}, errFailedRecently // the lookup's owner logged why
 	}
 	// Lookup failures (e.g. a dead CDN node) aren't persisted, so remember them briefly to avoid
 	// retrying on every readdir/lookup/getattr.
 	if time.Since(failed[id]) < failTTL {
 		lookupMu.Unlock()
-		return meta{}, fmt.Errorf("media %d: lookup failed recently", id)
+		return meta{}, errFailedRecently
 	}
 	ch := make(chan struct{})
 	lookups[id] = ch
@@ -573,11 +601,15 @@ func info(id int) (meta, error) {
 
 	lookupMu.Lock()
 	delete(lookups, id)
-	if err != nil {
+	if err != nil && m.Size == 0 {
 		failed[id] = time.Now()
 	}
 	lookupMu.Unlock()
 	close(ch)
+	if err != nil && m.Size > 0 {
+		log.Printf("media %d: %v", id, err) // gone, but within goneGrace: keep listing it
+		return m, nil
+	}
 	if err != nil {
 		return m, err
 	}
@@ -586,7 +618,7 @@ func info(id int) (meta, error) {
 
 func withSize(id int, m meta) (meta, error) {
 	if m.Size == 0 {
-		return m, fmt.Errorf("media %d: no direct source", id)
+		return m, errNoSource
 	}
 	return m, nil
 }
@@ -594,7 +626,8 @@ func withSize(id int, m meta) (meta, error) {
 // knownMeta returns persisted meta, unless it's missing or a no-source result older than refreshTTL.
 func knownMeta(id int) (meta, bool) {
 	m, written, ok := readMeta(id)
-	return m, ok && (m.Size > 0 || time.Since(written) < refreshTTL)
+	// No-source results and titles in their goneGrace period are rechecked after refreshTTL.
+	return m, ok && ((m.Size > 0 && m.Gone.IsZero()) || time.Since(written) < refreshTTL)
 }
 
 func metaFile(id int) string {
@@ -639,7 +672,18 @@ func streamURL(id int, force bool) (string, int64, error) {
 	if ok && !force && time.Since(e.at) < urlTTL {
 		return e.url, e.size, nil
 	}
+	lookupMu.Lock()
+	recent := !force && time.Since(failed[id]) < playFailTTL
+	lookupMu.Unlock()
+	if recent {
+		return "", 0, errFailedRecently
+	}
 	u, m, err := resolve(id, true)
+	if err != nil {
+		lookupMu.Lock()
+		failed[id] = time.Now()
+		lookupMu.Unlock()
+	}
 	return u, m.Size, err
 }
 
@@ -713,7 +757,7 @@ func refresher() {
 		}
 		_, m, err := resolve(oldest, false)
 		if err != nil {
-			log.Printf("refresh: %v", err)
+			log.Printf("refresh %d: %v", oldest, err)
 			// Push it to the back of the queue so one failing title doesn't block the rest.
 			os.Chtimes(metaFile(oldest), time.Now(), time.Now())
 			continue
@@ -722,7 +766,7 @@ func refresher() {
 			continue
 		}
 		if changed, err := fetchSubtitle(m.Sub); err != nil {
-			log.Printf("refresh: %v", err)
+			log.Printf("refresh %d: %v", oldest, err)
 		} else if changed {
 			log.Printf("media %d: subtitle %s changed", oldest, m.Sub)
 			m.Changed = time.Now()
