@@ -10,4 +10,5 @@ RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags=
 
 FROM alpine:3
 COPY --from=build /sloflixfs /usr/local/bin/
-CMD ["sloflixfs", "-mount", "/mnt/sloflix/library", "-cache", "/cache", "-allow-other"]
+ENV SLOFLIX_MOUNT=/mnt/sloflix/library SLOFLIX_CACHE=/cache SLOFLIX_ALLOW_OTHER=true
+CMD ["sloflixfs"]

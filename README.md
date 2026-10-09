@@ -57,7 +57,7 @@ In each library's settings, **disable** these, since they read whole files from 
 - Chapter image extraction
 - Real-time monitoring
 
-For a first try, set `SLOFLIX_ARGS=-limit-movies 20 -limit-shows 2` in `.env` to list only the newest titles.
+For a first try, set `SLOFLIX_LIMIT_MOVIES=20` and `SLOFLIX_LIMIT_SHOWS=2` in `.env` (and uncomment both in compose.yml) to list only the newest titles.
 
 ### How the Docker setup works
 
@@ -78,26 +78,27 @@ To let another user (such as a `jellyfin` service account or a container) read t
 
 ## Configuration
 
-Credentials come from the `SLOFLIX_USER` and `SLOFLIX_PASS` environment variables. Flags:
+Every option is a flag or an environment variable: `SLOFLIX_` plus the flag name in capitals, with `_` for `-`. The command line wins over the environment.
 
-| Flag | Default | Description |
-|---|---|---|
-| `-mount` | (required) | Mountpoint; created if missing. |
-| `-cache` | `~/.cache/sloflixfs` | Cache directory (`/cache` in Docker). |
-| `-refresh` | `12h` | How long catalog, season and episode listings are cached. |
-| `-revalidate` | `168h` | How often each title's size and subtitle are re-checked in the background. |
-| `-probe-cache` | `500` | Max new titles whose start is saved so Jellyfin's first probe needs no stream lookup (about 10–16 MB each, deleted once probed; 500 is up to about 8 GB). Beyond it, and with `0`, probes stream as usual. |
-| `-rate` | `1` | Max API requests per second. |
-| `-concurrency` | `3` | Max upstream lookups/fetches in flight (playback is exempt). |
-| `-allow-other` | `false` | Allow other users to access the mount. |
-| `-limit-movies`, `-limit-shows` | `0` (all) | List and crawl only the newest N titles; for testing. |
+| Flag | Environment | Default | Description |
+|---|---|---|---|
+| `-mount` | `SLOFLIX_MOUNT` | (required) | Mountpoint; created if missing. |
+| `-cache` | `SLOFLIX_CACHE` | `~/.cache/sloflixfs` | Cache directory (`/cache` in Docker). |
+| `-refresh` | `SLOFLIX_REFRESH` | `12h` | How long catalog, season and episode listings are cached. |
+| `-revalidate` | `SLOFLIX_REVALIDATE` | `168h` | How often each title's size and subtitle are re-checked in the background. |
+| `-probe-cache` | `SLOFLIX_PROBE_CACHE` | `500` | Max new titles whose start is saved so Jellyfin's first probe needs no stream lookup (about 10–16 MB each, deleted once probed; 500 is up to about 8 GB). Beyond it, and with `0`, probes stream as usual. |
+| `-rate` | `SLOFLIX_RATE` | `1` | Max API requests per second. |
+| `-concurrency` | `SLOFLIX_CONCURRENCY` | `3` | Max upstream lookups/fetches in flight (playback is exempt). |
+| `-allow-other` | `SLOFLIX_ALLOW_OTHER` | `false` | Allow other users to access the mount. |
+| `-limit-movies`, `-limit-shows` | `SLOFLIX_LIMIT_MOVIES`, `SLOFLIX_LIMIT_SHOWS` | `0` (all) | List and crawl only the newest N titles; for testing. |
+| `-user`, `-pass` | `SLOFLIX_USER`, `SLOFLIX_PASS` | (required) | sloflix credentials. Prefer the environment for the password, since other users can see command-line arguments. |
 
-With Docker Compose, put extra flags in `SLOFLIX_ARGS` in `.env`.
+With Docker Compose, set options in `.env` (e.g. `SLOFLIX_PROBE_CACHE=1000`); uncomment its line in compose.yml to pass it through. The image sets the mount, cache and `-allow-other` itself.
 
 ## Caching and upstream requests
 
 | What | Stored | Refreshed |
-|---|---|---|
+|---|---|---|---|
 | Login token | disk | when missing or rejected |
 | Catalog, season and episode listings | memory + disk | by the crawler after `-refresh` (listings always serve the cached copy); the old copy is kept if the refresh fails or shrinks by >10% (accepted after 24h) |
 | File size, subtitle name, plot per title | disk | on open, and by the crawler every `-revalidate` (titles without a source: every `-refresh`) |

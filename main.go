@@ -4,10 +4,12 @@ package main
 import (
 	"errors"
 	"flag"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -31,10 +33,14 @@ func main() {
 	limitMovies := flag.Int("limit-movies", 0, "list only the newest N movies (0 = all), for testing")
 	limitShows := flag.Int("limit-shows", 0, "list only the newest N shows (0 = all), for testing")
 	allowOther := flag.Bool("allow-other", false, "let other users (e.g. Jellyfin in Docker) access the mount")
+	flag.StringVar(&cfg.Username, "user", "", "sloflix username")
+	flag.StringVar(&cfg.Password, "pass", "", "sloflix password; prefer the environment variable, since other users can see arguments")
+	if err := envDefaults(flag.CommandLine, os.Getenv); err != nil {
+		log.Fatal(err)
+	}
 	flag.Parse()
-	cfg.Username, cfg.Password = os.Getenv("SLOFLIX_USER"), os.Getenv("SLOFLIX_PASS")
 	if *mount == "" || cfg.Username == "" || cfg.Password == "" {
-		log.Fatal("usage: SLOFLIX_USER=.. SLOFLIX_PASS=.. sloflixfs -mount DIR")
+		log.Fatal("usage: sloflixfs -mount DIR, with credentials in SLOFLIX_USER and SLOFLIX_PASS (or -user, -pass); -h lists all options")
 	}
 	if cfg.Rate <= 0 || cfg.Concurrency <= 0 {
 		log.Fatal("-rate and -concurrency must be positive")
@@ -90,4 +96,20 @@ func main() {
 		time.AfterFunc(2*time.Second, func() { os.Exit(0) })
 	}()
 	server.Wait()
+}
+
+// envDefaults lets every flag also be set from the environment, as SLOFLIX_ and the flag name in upper case
+// with - as _ (-probe-cache: SLOFLIX_PROBE_CACHE). The command line wins over the environment.
+func envDefaults(fs *flag.FlagSet, getenv func(string) string) error {
+	var err error
+	fs.VisitAll(func(f *flag.Flag) {
+		name := "SLOFLIX_" + strings.ToUpper(strings.ReplaceAll(f.Name, "-", "_"))
+		f.Usage += " (env " + name + ")"
+		if v := getenv(name); v != "" && err == nil {
+			if e := f.Value.Set(v); e != nil {
+				err = fmt.Errorf("%s=%q: %v", name, v, e)
+			}
+		}
+	})
+	return err
 }
