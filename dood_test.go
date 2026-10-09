@@ -87,6 +87,18 @@ func TestProbeSize(t *testing.T) {
 	if _, err := probeSize(srv.URL + "/gone"); !errors.Is(err, errFileGone) {
 		t.Fatalf("gone: %v", err)
 	}
+
+	// A video server that refused two connections in a row is skipped without another attempt.
+	dead, _ := net.Listen("tcp", "127.0.0.1:0")
+	dead.Close()
+	for i := range 2 {
+		if _, err := probeSize("http://" + dead.Addr().String() + "/f"); err == nil || strings.Contains(err.Error(), "skipped") {
+			t.Fatalf("probe %d of a dead server should try to connect: %v", i+1, err)
+		}
+	}
+	if _, err := probeSize("http://" + dead.Addr().String() + "/f"); err == nil || !strings.Contains(err.Error(), "skipped") {
+		t.Fatalf("third probe of a dead server should be skipped: %v", err)
+	}
 }
 
 // sloflix spells the source name inconsistently ("DoodStream", "Doodstream"); both must use the embed fallback.

@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"math/rand/v2"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -160,7 +161,63 @@ type showInfo struct {
 func cdnTransport() *http.Transport {
 	t := http.DefaultTransport.(*http.Transport).Clone()
 	t.ResponseHeaderTimeout = 30 * time.Second
+	// Healthy video servers connect in ~100ms; a dead one shouldn't hold a lookup for long.
+	t.DialContext = (&net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}).DialContext
 	return t
+}
+
+// cdnDo sends req to a video server, failing fast while its host is remembered as down.
+func cdnDo(req *http.Request) (*http.Response, error) {
+	addr := hostPort(req.URL)
+	if ok, known := hostStatus(addr); known && !ok {
+		return nil, fmt.Errorf("video server %s failed recently, skipped", req.URL.Host)
+	}
+	resp, err := cdnClient.Do(req)
+	hostResult(addr, err)
+	return resp, err
+}
+
+var (
+	hostMu sync.Mutex
+	hostOK = map[string]hostCheck{} // host:port -> last connection outcome (artwork hosts, video servers)
+)
+
+type hostCheck struct {
+	ok    bool
+	at    time.Time
+	fails int // consecutive failures
+}
+
+// hostStatus returns a host's remembered outcome while it's fresh (failTTL): a success, or two or more
+// failures in a row. A single failure (e.g. a DNS blip) isn't remembered, so the next request tries again.
+func hostStatus(addr string) (ok, known bool) {
+	hostMu.Lock()
+	defer hostMu.Unlock()
+	c := hostOK[addr]
+	return c.ok, (c.ok || c.fails >= 2) && time.Since(c.at) < failTTL
+}
+
+// hostResult records a connection outcome and returns the number of consecutive failures.
+func hostResult(addr string, err error) int {
+	hostMu.Lock()
+	defer hostMu.Unlock()
+	c := hostOK[addr]
+	if err != nil {
+		c.fails++
+	} else {
+		c.fails = 0
+	}
+	c.ok, c.at = err == nil, time.Now()
+	hostOK[addr] = c
+	return c.fails
+}
+
+func hostPort(u *url.URL) string {
+	port := u.Port()
+	if port == "" {
+		port = map[string]string{"http": "80", "https": "443"}[u.Scheme]
+	}
+	return net.JoinHostPort(u.Hostname(), port)
 }
 
 // newRequest builds a request with the browser User-Agent. URLs partly come from upstream data, so an
@@ -497,7 +554,7 @@ func probeSize(stream string) (int64, error) {
 	}
 	req.Header.Set("Referer", referer)
 	req.Header.Set("Range", "bytes=0-0")
-	resp, err := cdnClient.Do(req)
+	resp, err := cdnDo(req)
 	if err != nil {
 		return 0, err
 	}
