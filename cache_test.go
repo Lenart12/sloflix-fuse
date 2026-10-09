@@ -54,9 +54,12 @@ func TestCachedPerKeyLock(t *testing.T) {
 	slots = make(chan struct{}, 2)
 	mem = map[string]memEntry{}
 
-	block := make(chan struct{})
-	defer close(block)
-	go cached("slow", func() ([]item, error) { <-block; return nil, nil })
+	block, slowDone := make(chan struct{}), make(chan struct{})
+	defer func() { close(block); <-slowDone }() // don't leak the fetch into later tests
+	go func() {
+		cached("slow", func() ([]item, error) { <-block; return nil, nil })
+		close(slowDone)
+	}()
 	time.Sleep(50 * time.Millisecond) // let the slow fetch take its lock
 
 	done := make(chan struct{})
