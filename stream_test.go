@@ -20,8 +20,12 @@ func TestStream(t *testing.T) {
 	var fresh atomic.Bool
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requests.Add(1)
-		if strings.Contains(r.URL.Path, "expired") || r.Header.Get("Referer") == "" {
-			http.Error(w, "gone", http.StatusForbidden)
+		if r.Header.Get("Referer") == "" {
+			http.Error(w, "no referer", http.StatusForbidden)
+			return
+		}
+		if strings.Contains(r.URL.Path, "expired") { // what the CDN sends for an expired link
+			w.Write([]byte("error_expired"))
 			return
 		}
 		http.ServeContent(w, r, "f.mp4", time.Time{}, bytes.NewReader(data))
@@ -51,7 +55,7 @@ func TestStream(t *testing.T) {
 		}
 	}
 
-	read(0, 1000) // expired URL -> 403 -> re-resolve -> 206
+	read(0, 1000) // expired URL -> 200 "error_expired" -> re-resolve -> 206
 	if resolves.Load() != 2 || requests.Load() != 2 {
 		t.Fatalf("re-resolve: resolves=%d requests=%d", resolves.Load(), requests.Load())
 	}
