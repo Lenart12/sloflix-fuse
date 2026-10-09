@@ -468,7 +468,8 @@ func probeSize(stream string) (int64, error) {
 var (
 	// Many titles only carry a DoodStream embed link, often on a dead mirror domain. Video codes work on any
 	// mirror, so embeds are opened here instead.
-	doodMirror = "https://myvidplay.com/e/"
+	// doodstream.com redirects to whichever mirror is currently live.
+	doodMirror = "https://doodstream.com/e/"
 
 	errVideoGone = errors.New("video not found on DoodStream")
 	passMD5      = regexp.MustCompile(`/pass_md5/[^'"]+`)
