@@ -331,11 +331,13 @@ var (
 )
 
 type hostCheck struct {
-	ok bool
-	at time.Time
+	ok    bool
+	at    time.Time
+	fails int // consecutive failed checks
 }
 
 // reachable reports whether an artwork URL's host accepts connections, checked once per failTTL per host.
+// A single failure (e.g. a DNS blip) is rechecked after a minute; only two in a row drop the host for failTTL.
 // Jellyfin aborts a whole metadata refresh when an image download times out, so a dead host must not
 // end up in an NFO.
 // ponytail: global lock, so a dead host's 5s dial briefly stalls other NFOs; per-host locks if it shows.
@@ -351,17 +353,25 @@ func reachable(uri string) bool {
 	addr := net.JoinHostPort(u.Hostname(), port)
 	hostMu.Lock()
 	defer hostMu.Unlock()
-	if c, ok := hostOK[addr]; ok && time.Since(c.at) < failTTL {
+	c := hostOK[addr]
+	ttl := failTTL
+	if !c.ok && c.fails < 2 {
+		ttl = time.Minute
+	}
+	if !c.at.IsZero() && time.Since(c.at) < ttl {
 		return c.ok
 	}
 	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
 	if err != nil {
-		log.Printf("artwork host %s unreachable, left out of NFOs: %v", addr, err)
+		c.fails++
+		log.Printf("artwork host %s unreachable (%d in a row), left out of NFOs: %v", addr, c.fails, err)
 	} else {
 		conn.Close()
+		c.fails = 0
 	}
-	hostOK[addr] = hostCheck{err == nil, time.Now()}
-	return err == nil
+	c.ok, c.at = err == nil, time.Now()
+	hostOK[addr] = c
+	return c.ok
 }
 
 // nfoChild renders sloflix's metadata as a Jellyfin/Kodi NFO, so titles TMDB can't match still get a plot,

@@ -37,6 +37,16 @@ func TestReachable(t *testing.T) {
 	if reachable("http://" + dead.Addr().String() + "/a.jpg") {
 		t.Fatal("closed port reported reachable")
 	}
+	// One failure is rechecked after a minute; two in a row hold for failTTL.
+	up := l.Addr().String()
+	hostOK[up] = hostCheck{at: time.Now().Add(-2 * time.Minute), fails: 1}
+	if !reachable("http://" + up + "/a.jpg") {
+		t.Fatal("single failure not rechecked after a minute")
+	}
+	hostOK[up] = hostCheck{at: time.Now().Add(-2 * time.Minute), fails: 2}
+	if reachable("http://" + up + "/a.jpg") {
+		t.Fatal("two failures in a row should hold for failTTL")
+	}
 	if reachable("data:image/jpeg;base64,AA==") {
 		t.Fatal("URL without host reported reachable")
 	}
