@@ -2,9 +2,11 @@ package main
 
 import (
 	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"regexp"
+	"sync/atomic"
 	"testing"
 )
 
@@ -46,7 +48,7 @@ func TestDoodURL(t *testing.T) {
 }
 
 func TestProbeSize(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/gone" {
 			w.Header().Set("Content-Type", "text/html")
 			w.Write([]byte("error_nofile"))
@@ -56,9 +58,21 @@ func TestProbeSize(t *testing.T) {
 		w.WriteHeader(http.StatusPartialContent)
 		w.Write([]byte("x"))
 	}))
+	var conns atomic.Int32
+	srv.Config.ConnState = func(_ net.Conn, st http.ConnState) {
+		if st == http.StateNew {
+			conns.Add(1)
+		}
+	}
+	srv.Start()
 	defer srv.Close()
-	if n, err := probeSize(srv.URL + "/ok"); err != nil || n != 12345 {
-		t.Fatalf("ok: %d %v", n, err)
+	for range 2 {
+		if n, err := probeSize(srv.URL + "/ok"); err != nil || n != 12345 {
+			t.Fatalf("ok: %d %v", n, err)
+		}
+	}
+	if conns.Load() != 1 {
+		t.Fatalf("probe connections not reused: %d", conns.Load())
 	}
 	if _, err := probeSize(srv.URL + "/gone"); !errors.Is(err, errFileGone) {
 		t.Fatalf("gone: %v", err)

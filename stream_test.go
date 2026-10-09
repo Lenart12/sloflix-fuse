@@ -28,16 +28,16 @@ func TestStream(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	s := &stream{size: int64(len(data)), resolve: func(force bool) (string, int64, error) {
+	s := &stream{size: int64(len(data)), resolve: func(force bool) (string, error) {
 		// First URL is "expired"; a forced re-resolve yields a working one.
 		resolves.Add(1)
 		if force {
 			fresh.Store(true)
 		}
 		if fresh.Load() {
-			return srv.URL + "/ok", int64(len(data)), nil
+			return srv.URL + "/ok", nil
 		}
-		return srv.URL + "/expired", int64(len(data)), nil
+		return srv.URL + "/expired", nil
 	}}
 	read := func(off int64, n int) {
 		t.Helper()
@@ -89,10 +89,32 @@ func TestStreamStall(t *testing.T) {
 		http.ServeContent(w, r, "f.mp4", time.Time{}, bytes.NewReader(data))
 	}))
 	defer srv.Close()
-	s := &stream{size: int64(len(data)), resolve: func(bool) (string, int64, error) { return srv.URL, int64(len(data)), nil }}
+	s := &stream{size: int64(len(data)), resolve: func(bool) (string, error) { return srv.URL, nil }}
 	res, errno := s.Read(context.Background(), make([]byte, 1000), 0)
 	if errno != 0 || res.Size() != 1000 {
 		t.Fatalf("stalled read not retried: errno=%v size=%d requests=%d", errno, res.Size(), requests.Load())
+	}
+	s.Release(context.Background())
+}
+
+// A new size on the first response is adopted; a new size after data was served fails instead of splicing files.
+func TestStreamSizeChange(t *testing.T) {
+	data := bytes.Repeat([]byte("y"), 1<<21)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.ServeContent(w, r, "f.mp4", time.Time{}, bytes.NewReader(data))
+	}))
+	defer srv.Close()
+	var resized int64
+	s := &stream{size: 1000, resolve: func(bool) (string, error) { return srv.URL, nil }, resized: func(n int64) { resized = n }}
+	if res, errno := s.Read(context.Background(), make([]byte, 4096), 0); errno != 0 || res.Size() != 4096 {
+		t.Fatalf("first read: errno=%v size=%d", errno, res.Size())
+	}
+	if resized != int64(len(data)) || s.size != int64(len(data)) {
+		t.Fatalf("resized=%d size=%d", resized, s.size)
+	}
+	data = data[:1<<20] // replaced upstream while open
+	if _, errno := s.Read(context.Background(), make([]byte, 10), 10); errno == 0 {
+		t.Fatal("reconnect to a different-size file should fail")
 	}
 	s.Release(context.Background())
 }

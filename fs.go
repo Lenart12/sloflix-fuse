@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -113,22 +114,24 @@ func (v *video) Getattr(ctx context.Context, f fs.FileHandle, out *fuse.AttrOut)
 
 func (v *video) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
 	log.Printf("open %d: %s", v.id, v.Path(nil))
-	known, _, _ := readMeta(v.id)
-	resolve := func(force bool) (string, int64, error) {
-		u, size, err := streamURL(v.id, force)
-		if err == nil && size != known.Size {
-			// Upstream file changed: drop the kernel's cached attrs so it stops clamping reads to the old size.
-			known.Size = size
-			v.NotifyContent(-1, 0)
-		}
-		return u, size, err
-	}
-	_, size, err := resolve(false)
+	_, size, err := streamURL(v.id, false)
 	if err != nil {
 		log.Printf("open %d: %v", v.id, err)
 		return nil, 0, syscall.EIO
 	}
-	return &stream{size: size, resolve: resolve}, 0, 0
+	return &stream{
+		size: size,
+		resolve: func(force bool) (string, error) {
+			u, _, err := streamURL(v.id, force)
+			return u, err
+		},
+		resized: func(size int64) {
+			setSize(v.id, size)
+			// Drop the kernel's cached attrs so it stops clamping reads to the old size. Async: invalidating
+			// from inside the read that's still in flight on this inode could deadlock.
+			go v.NotifyContent(-1, 0)
+		},
+	}, 0, 0
 }
 
 // mtimeOf bumps an item's mtime when its source or subtitle changed, so Jellyfin re-probes it.
@@ -143,7 +146,9 @@ func mtimeOf(created time.Time, m meta) time.Time {
 type stream struct {
 	mu      sync.Mutex
 	size    int64
-	resolve func(force bool) (string, int64, error)
+	resolve func(force bool) (string, error)
+	resized func(size int64) // called when the first response shows the upstream file has a new size
+	served  bool             // data was already returned, so a size change would splice two files
 	body    io.ReadCloser
 	pos     int64
 }
@@ -158,11 +163,10 @@ func (s *stream) close() {
 func (s *stream) open(off int64) error {
 	s.close()
 	for attempt := 0; attempt < 2; attempt++ {
-		u, size, err := s.resolve(attempt > 0)
+		u, err := s.resolve(attempt > 0)
 		if err != nil {
 			return err
 		}
-		s.size = size
 		req, err := newRequest(context.Background(), "GET", u, nil)
 		if err != nil {
 			return err
@@ -175,6 +179,17 @@ func (s *stream) open(off int64) error {
 			continue
 		}
 		if resp.StatusCode == http.StatusPartialContent {
+			_, total, _ := strings.Cut(resp.Header.Get("Content-Range"), "/")
+			if size, _ := strconv.ParseInt(total, 10, 64); size > 0 && size != s.size {
+				if s.served {
+					resp.Body.Close()
+					return fmt.Errorf("upstream file changed from %d to %d bytes while open", s.size, size)
+				}
+				s.size = size
+				if s.resized != nil {
+					s.resized(size)
+				}
+			}
 			s.body, s.pos = resp.Body, off
 			return nil
 		}
@@ -187,15 +202,18 @@ func (s *stream) open(off int64) error {
 func (s *stream) Read(ctx context.Context, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if off >= s.size {
-		return fuse.ReadResultData(nil), 0
-	}
-	dest = dest[:min(int64(len(dest)), s.size-off)]
+	buf := dest
 	for attempt := 0; attempt < 2; attempt++ {
+		if off >= s.size {
+			return fuse.ReadResultData(nil), 0
+		}
 		if s.body == nil || off < s.pos || off-s.pos > skipMax {
 			if err := s.open(off); err != nil {
 				log.Printf("stream: %v", err)
 				return nil, syscall.EIO
+			}
+			if off >= s.size { // the first response may have shown a smaller file
+				return fuse.ReadResultData(nil), 0
 			}
 		} else if off > s.pos {
 			if err := s.withDeadline(func(r io.Reader) error { _, err := io.CopyN(io.Discard, r, off-s.pos); return err }); err != nil {
@@ -204,10 +222,12 @@ func (s *stream) Read(ctx context.Context, dest []byte, off int64) (fuse.ReadRes
 			}
 			s.pos = off
 		}
+		dest := buf[:min(int64(len(buf)), s.size-off)]
 		var n int
 		err := s.withDeadline(func(r io.Reader) (err error) { n, err = io.ReadFull(r, dest); return err })
 		s.pos += int64(n)
 		if err == nil {
+			s.served = true
 			return fuse.ReadResultData(dest), 0
 		}
 		log.Printf("stream: read at %d: %v", off, err)

@@ -405,7 +405,10 @@ func resolve(id int, hi bool) (string, meta, error) {
 			m.Sub = *doodSub
 		}
 	}
-	if stream != "" {
+	if prev, _, ok := readMeta(id); stream != "" && hi && ok && prev.Size > 0 {
+		// Playback skips the size probe: the stream checks the size on every response (stream.open).
+		m.Size = prev.Size
+	} else if stream != "" {
 		size, err := probeSize(stream)
 		if errors.Is(err, errFileGone) {
 			stream, missing = "", err
@@ -460,6 +463,7 @@ func probeSize(stream string) (int64, error) {
 	_, total, _ := strings.Cut(resp.Header.Get("Content-Range"), "/")
 	size, _ := strconv.ParseInt(total, 10, 64)
 	if resp.StatusCode == http.StatusPartialContent && size > 0 {
+		io.Copy(io.Discard, resp.Body) // read the 1 byte so the connection is reused for the stream that follows
 		return size, nil
 	}
 	if b, _ := io.ReadAll(io.LimitReader(resp.Body, 64)); bytes.Contains(b, []byte("error_nofile")) {
@@ -614,6 +618,20 @@ func readMeta(id int) (meta, time.Time, bool) {
 
 // streamURL returns a memoized stream URL and its size, or fresh ones if force is set or it is older than urlTTL.
 // Resolving also refreshes the item's persisted meta, so opening a file revalidates its size and subtitle.
+// setSize records a size seen by a stream that differs from the cached one: the upstream file was replaced.
+func setSize(id int, size int64) {
+	m, _, _ := readMeta(id)
+	log.Printf("media %d changed: size %d -> %d", id, m.Size, size)
+	m.Size, m.Changed = size, time.Now()
+	writeMeta(id, m)
+	urlMu.Lock()
+	if e, ok := urls[id]; ok {
+		e.size = size
+		urls[id] = e
+	}
+	urlMu.Unlock()
+}
+
 func streamURL(id int, force bool) (string, int64, error) {
 	urlMu.Lock()
 	e, ok := urls[id]
