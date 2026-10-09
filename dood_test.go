@@ -41,23 +41,29 @@ func TestDoodURL(t *testing.T) {
 	}))
 	defer srv.Close()
 	doodMirror = srv.URL + "/e/"
+	takes := 0
+	noWait := func() error { takes++; return nil }
 
-	u, err := doodURL("good")
+	u, err := doodURL("good", noWait)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !regexp.MustCompile(`^https://cdn\.example/path/file~[A-Za-z0-9]{10}\?token=tok42&expiry=\d{13}$`).MatchString(u) {
 		t.Fatalf("bad url %q", u)
 	}
-	if _, err := doodURL("gone"); !errors.Is(err, errVideoGone) {
+	if _, err := doodURL("gone", noWait); !errors.Is(err, errVideoGone) {
 		t.Fatalf("gone: %v", err)
 	}
-	if _, err := doodURL("challenge"); err == nil || errors.Is(err, errVideoGone) {
+	if _, err := doodURL("challenge", noWait); err == nil || errors.Is(err, errVideoGone) {
 		t.Fatalf("challenge page should be a transient error, got %v", err)
 	}
 
-	if _, err := doodURL("captcha"); err == nil || errors.Is(err, errVideoGone) || !strings.Contains(err.Error(), "captcha") {
+	if _, err := doodURL("captcha", noWait); err == nil || errors.Is(err, errVideoGone) || !strings.Contains(err.Error(), "captcha") {
 		t.Fatalf("captcha should be a transient captcha error, got %v", err)
+	}
+	// Only the working lookup reached pass_md5, the one request DoodStream counts.
+	if takes != 1 {
+		t.Fatalf("%d lookups took a DoodStream slot, want 1", takes)
 	}
 }
 

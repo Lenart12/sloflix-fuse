@@ -89,19 +89,25 @@ var (
 	loQ = make(chan struct{})
 )
 
-// DoodStream lookups have their own limit: playmogo.com (where every mirror redirects) allows 15 per IP per
-// 5 minutes, then answers with RELOAD and a captcha for ~5 minutes (measured 2026-10-09). The crawler leaves
-// doodReserve of them for playback.
+// DoodStream lookups have their own limit: playmogo.com (where every mirror redirects) allows 15 pass_md5
+// requests per IP per 5 minutes, then answers with RELOAD and a captcha for ~5 minutes (measured 2026-10-09).
+// The crawler leaves doodReserve of them for playback.
 const (
 	doodMax     = 15
 	doodReserve = 3
 )
 
 var (
-	doodWindow = 5*time.Minute + 10*time.Second // a var for tests
+	doodWindow = 5*time.Minute + 10*time.Second // the measured 5 minutes plus margin; a var for tests
 	doodMu     sync.Mutex
 	doodSent   []time.Time // DoodStream lookups within doodWindow, oldest first; guarded by doodMu
+	doodLastLo time.Time   // the crawler's last lookup; guarded by doodMu
 )
+
+// doodPace spaces the crawler's lookups evenly over the window, at its share of it: 5m10s / (15-3) = 25.8s.
+// Bursts of 12 would be just as much within the limit, but leave the crawler idle (and the log silent) for
+// minutes, and would be the first thing to break if DoodStream ever penalised bursts.
+func doodPace() time.Duration { return doodWindow / (doodMax - doodReserve) }
 
 // doodTake waits until a DoodStream lookup fits the window, then records it. A sliding window of 15 also
 // stays within a fixed window or token bucket of that size, whichever DoodStream uses. Playback doesn't
@@ -117,12 +123,21 @@ func doodTake(hi bool) error {
 		for len(doodSent) > 0 && now.Sub(doodSent[0]) >= doodWindow {
 			doodSent = doodSent[1:]
 		}
-		if len(doodSent) < limit {
+		var wait time.Duration
+		if len(doodSent) >= limit {
+			wait = doodSent[len(doodSent)-limit].Add(doodWindow).Sub(now)
+		}
+		if !hi {
+			wait = max(wait, doodLastLo.Add(doodPace()).Sub(now))
+		}
+		if wait <= 0 {
 			doodSent = append(doodSent, now)
+			if !hi {
+				doodLastLo = now
+			}
 			doodMu.Unlock()
 			return nil
 		}
-		wait := doodSent[len(doodSent)-limit].Add(doodWindow).Sub(now)
 		doodMu.Unlock()
 		if hi {
 			return fmt.Errorf("DoodStream lookup limit reached, free again in %v", wait.Round(time.Second))
@@ -593,14 +608,12 @@ func resolve(id int, hi bool) (string, meta, error) {
 		if doodCode == prev.DeadCode && prev.Size == 0 { // a title in goneGrace (Size > 0) is verified again
 			err = errVideoGone
 		} else {
-			// Give up the concurrency slot while queued for DoodStream, so lookups that don't need it go on.
-			release()
-			err = doodTake(hi)
-			release = acquire(hi)
-			if err != nil {
-				return "", meta{}, err
-			}
-			stream, err = doodURL(doodCode)
+			stream, err = doodURL(doodCode, func() error {
+				// Give up the concurrency slot while queued for DoodStream, so lookups that don't need it go on.
+				release()
+				defer func() { release = acquire(hi) }()
+				return doodTake(hi)
+			})
 		}
 		if err != nil {
 			if !errors.Is(err, errVideoGone) {
@@ -786,10 +799,10 @@ var (
 
 // doodURL turns a DoodStream video code into a direct, tokenized MP4 URL, the same way the embed player does:
 // the embed page names a /pass_md5/ path whose response is the file's base URL.
-func doodURL(code string) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
+func doodURL(code string, take func() error) (string, error) {
 	get := func(u, ref string) ([]byte, *http.Response, error) {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
 		req, err := newRequest(ctx, "GET", u, nil)
 		if err != nil {
 			return nil, nil, err
@@ -806,13 +819,16 @@ func doodURL(code string) (string, error) {
 		}
 		return b, resp, err
 	}
-	log.Printf("dood: GET %s", code)
-	page, resp, err := get(doodMirror+code, "https://www.sloflix.com/")
-	if err != nil {
-		return "", err
-	}
-	p := passMD5.Find(page)
-	if p == nil {
+	// load opens the player page and returns its pass_md5 path and (redirected) URL.
+	load := func() ([]byte, *url.URL, error) {
+		log.Printf("dood: GET %s", code)
+		page, resp, err := get(doodMirror+code, "https://www.sloflix.com/")
+		if err != nil {
+			return nil, nil, err
+		}
+		if p := passMD5.Find(page); p != nil {
+			return p, resp.Request.URL, nil
+		}
 		// Only an explicit "Video not found" means deleted; anything else (anti-bot or rate-limit pages)
 		// is transient, so the title isn't persisted as gone.
 		var title string
@@ -820,14 +836,28 @@ func doodURL(code string) (string, error) {
 			title = string(m[1])
 		}
 		if strings.Contains(strings.ToLower(title), "video not found") {
-			return "", errVideoGone
+			return nil, nil, errVideoGone
 		}
 		if bytes.Contains(page, []byte("turnstile")) {
-			return "", fmt.Errorf("doodstream %s: asks for a captcha (Turnstile)", code)
+			return nil, nil, fmt.Errorf("doodstream %s: asks for a captcha (Turnstile)", code)
 		}
-		return "", fmt.Errorf("doodstream %s: no pass_md5 in page (title %q)", code, title)
+		return nil, nil, fmt.Errorf("doodstream %s: no pass_md5 in page (title %q)", code, title)
 	}
-	embed := resp.Request.URL // after the mirror's redirect
+	p, embed, err := load()
+	if err != nil {
+		return "", err
+	}
+	// Only the pass_md5 request counts toward DoodStream's limit (player pages, deleted and unknown videos
+	// don't; measured 2026-10-09), so the slot is taken only now.
+	waitStart := time.Now()
+	if err := take(); err != nil {
+		return "", err
+	}
+	if time.Since(waitStart) > time.Second { // the page's pass_md5 path may have gone stale while waiting
+		if p, embed, err = load(); err != nil {
+			return "", err
+		}
+	}
 	base, _, err := get(embed.Scheme+"://"+embed.Host+string(p), embed.String())
 	if err != nil {
 		return "", err

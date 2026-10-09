@@ -2,6 +2,7 @@ package main
 
 import (
 	"os"
+	"slices"
 	"testing"
 	"time"
 )
@@ -49,12 +50,10 @@ func TestThrottlePrefersHi(t *testing.T) {
 // The crawler stops at doodMax-doodReserve lookups per window; playback can still use the rest, and fails
 // at once instead of waiting when the window is full.
 func TestDoodWindow(t *testing.T) {
-	defer func(w time.Duration) { doodWindow, doodSent = w, nil }(doodWindow)
-	doodWindow, doodSent = 500*time.Millisecond, nil
+	defer func(w time.Duration) { doodWindow, doodSent, doodLastLo = w, nil, time.Time{} }(doodWindow)
+	doodWindow, doodLastLo = 500*time.Millisecond, time.Time{}
 	start := time.Now()
-	for range doodMax - doodReserve {
-		doodTake(false)
-	}
+	doodSent = slices.Repeat([]time.Time{start}, doodMax-doodReserve) // the crawler's share, used
 	crawled := make(chan struct{})
 	go func() { doodTake(false); close(crawled) }()
 	time.Sleep(50 * time.Millisecond)
@@ -71,11 +70,24 @@ func TestDoodWindow(t *testing.T) {
 	if err := doodTake(true); err == nil {
 		t.Fatalf("lookup %d in a full window should fail", doodMax+1)
 	}
-	if time.Since(start) > 300*time.Millisecond {
-		t.Fatal("lookups within the limits waited")
-	}
 	<-crawled // once the oldest lookups leave the window
 	if waited := time.Since(start); waited < 450*time.Millisecond {
 		t.Fatalf("crawler lookup %d only waited %v", doodMax-doodReserve+1, waited)
+	}
+}
+
+// The crawler's lookups are spaced doodPace apart; playback isn't paced.
+func TestDoodPace(t *testing.T) {
+	defer func(w time.Duration) { doodWindow, doodSent, doodLastLo = w, nil, time.Time{} }(doodWindow)
+	doodWindow, doodSent, doodLastLo = 1200*time.Millisecond, nil, time.Time{} // pace 100ms
+	start := time.Now()
+	doodTake(false)
+	doodTake(true)
+	if time.Since(start) > 50*time.Millisecond {
+		t.Fatal("first crawler lookup or playback waited")
+	}
+	doodTake(false)
+	if waited := time.Since(start); waited < 90*time.Millisecond {
+		t.Fatalf("second crawler lookup after %v, want the %v pace", waited, doodPace())
 	}
 }
