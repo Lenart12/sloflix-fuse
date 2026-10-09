@@ -126,8 +126,11 @@ func resolve(id int, hi bool) (string, Meta, error) {
 	} else if stream == "" {
 		var got []string
 		for _, s := range d.Sources {
-			u, _ := url.Parse(s.Source)
-			got = append(got, fmt.Sprintf("%s@%s", s.Name, u.Host))
+			host := s.Source // some don't parse as URLs
+			if u, err := url.Parse(s.Source); err == nil {
+				host = u.Host
+			}
+			got = append(got, fmt.Sprintf("%s@%s", s.Name, host))
 		}
 		noSource = fmt.Errorf("no direct source (got %d: %v)", len(d.Sources), got)
 	}

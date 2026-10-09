@@ -77,6 +77,8 @@ func TestResolveDoodSpelling(t *testing.T) {
 			w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-0/%d", size.Load()))
 			w.WriteHeader(http.StatusPartialContent)
 			w.Write([]byte("x"))
+		case r.URL.Path == "/media/single/10": // a source URL that doesn't parse (title 9695 crashed resolve)
+			fmt.Fprintf(w, `{"status":"success","data":{"media_sources":[{"media_source":"https://x/%%zz","media_source_name":"X"}]}}`)
 		default: // the sloflix API
 			fmt.Fprintf(w, `{"status":"success","data":{"media_sources":[{"media_source":"https://do7go.com/e/abc","media_source_name":"SLOSubs (Doodstream)"}]}}`)
 		}
@@ -113,5 +115,8 @@ func TestResolveDoodSpelling(t *testing.T) {
 	writeMeta(9, Meta{Size: 65536}) // recorded as playable before minVideoSize existed
 	if _, err := Info(9); err == nil {
 		t.Fatal("tiny file recorded earlier is listed")
+	}
+	if _, _, err := resolve(10, false); err == nil || !strings.Contains(err.Error(), "no direct source") {
+		t.Fatalf("bad source URL: %v", err)
 	}
 }
