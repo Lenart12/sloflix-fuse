@@ -472,6 +472,7 @@ var (
 
 	errVideoGone = errors.New("video not found on DoodStream")
 	passMD5      = regexp.MustCompile(`/pass_md5/[^'"]+`)
+	htmlTitle    = regexp.MustCompile(`<title>([^<]*)`)
 )
 
 // doodURL turns a DoodStream video code into a direct, tokenized MP4 URL, the same way the embed player does:
@@ -503,7 +504,16 @@ func doodURL(code string) (string, error) {
 	}
 	p := passMD5.Find(page)
 	if p == nil {
-		return "", errVideoGone
+		// Only an explicit "Video not found" means deleted; anything else (anti-bot or rate-limit pages)
+		// is transient, so the title isn't persisted as gone.
+		var title string
+		if m := htmlTitle.FindSubmatch(page); m != nil {
+			title = string(m[1])
+		}
+		if strings.Contains(strings.ToLower(title), "video not found") {
+			return "", errVideoGone
+		}
+		return "", fmt.Errorf("doodstream %s: no pass_md5 in page (title %q)", code, title)
 	}
 	embed := resp.Request.URL // after the mirror's redirect
 	base, _, err := get(embed.Scheme+"://"+embed.Host+string(p), embed.String())
