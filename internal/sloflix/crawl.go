@@ -129,9 +129,7 @@ func crawlQueue(limitMovies, limitShows int) []int {
 	if len(ids) > 0 {
 		log.Printf("crawl: %d new, %d to recheck; %d of %d probe cache slots used", fresh, len(ids)-fresh, headCount(), probeCache)
 	}
-	if fresh == 0 {
-		go jellyfinScan()
-	}
+	go jellyfinScan() // at most hourly, and only after titles were newly listed
 	return ids
 }
 

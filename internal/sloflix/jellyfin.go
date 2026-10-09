@@ -11,8 +11,9 @@ import (
 )
 
 // Jellyfin can't watch a FUSE mount for changes, so the crawler asks it to scan the sloflix libraries
-// when titles it verified are waiting: when the probe cache is half full (so new titles keep getting
-// heads) or when no new titles are left to check.
+// when titles it newly listed are waiting: at each queue rebuild, and as soon as the probe cache is half
+// full (so new titles keep getting heads). Waiting for no new titles to be left wouldn't do: titles on
+// dead video servers stay new.
 var (
 	jfURL, jfKey, jfPath string
 
