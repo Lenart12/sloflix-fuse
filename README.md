@@ -103,13 +103,14 @@ With Docker Compose, put extra flags in `SLOFLIX_ARGS` in `.env`.
 | Stream URLs | memory | after 1h, or when the CDN rejects one |
 | Video data | not cached | |
 
-The first time a title is listed costs one API call plus one HEAD request to the CDN, to learn the file size. The first library scan therefore takes a while: roughly 1–2 seconds per title at the default rate (about 1–2 hours per 3000 titles). Every upstream request is logged, so `docker compose logs -f sloflix` shows what the cache is doing.
+The first time a title is listed costs one API call plus a 1-byte range request to the CDN, to learn the file size (and, for titles with only a DoodStream embed link, two requests to DoodStream). The first library scan therefore takes a while: roughly 1–2 seconds per title at the default rate (about 1–2 hours per 3000 titles). Opening a file costs one API call (cached for an hour) and then streams. API, DoodStream and size requests are logged one per line, and each closed file logs a summary of its stream connections, so `docker compose logs -f sloflix` shows what the cache is doing.
 
 ## Limitations
 
 - The CDN serves about 550 kB/s per connection, roughly 2–3× a typical bitrate here. That's fine for direct play, but slow for anything that reads whole files.
 - Supported sources: sloflix's direct links (DoodStream CDN or presigned Cloudflare R2 URLs) and DoodStream embed/download links, which are resolved through a working DoodStream mirror because many of sloflix's embed links point at dead mirror domains. StreamP2P-only titles and titles whose DoodStream video was deleted are not listed; that was about 8% of the catalog when tested.
-- Titles whose CDN host is unreachable are hidden and retried hourly.
+- DoodStream sometimes answers embed links with a captcha (Cloudflare Turnstile) instead of the player; one episode lasted about 10 minutes. sloflixfs doesn't try to get past it: the lookup fails as a temporary error (logged as `asks for a captcha`) and is retried later. Titles with only an embed link (about 30% of the catalog) can't be played or newly listed meanwhile; titles that were already listed stay listed.
+- Titles that were never playable and whose CDN host is unreachable are hidden and retried hourly. Titles that were playable stay listed through such errors, and are only hidden once upstream has reported them gone for 24 hours.
 - Sloflix only provides Slovenian and English titles. NFO files set the Slovenian title; the original-language title comes from TMDB when Jellyfin can match the item.
 - Requests send a browser User-Agent to pass Cloudflare. Stricter bot protection on sloflix's side would stop the mount from working.
 
