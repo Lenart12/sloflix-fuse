@@ -124,6 +124,7 @@ func (v *video) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, 
 		return nil, 0, syscall.EIO
 	}
 	return &stream{
+		id:   v.id,
 		size: size,
 		resolve: func(force bool) (string, error) {
 			u, _, err := streamURL(v.id, force)
@@ -148,6 +149,7 @@ func mtimeOf(created time.Time, m meta) time.Time {
 
 // stream serves reads from a single HTTP Range response, reopening it only on seeks.
 type stream struct {
+	id      int
 	mu      sync.Mutex
 	size    int64
 	resolve func(force bool) (string, error)
@@ -155,6 +157,10 @@ type stream struct {
 	served  bool             // data was already returned, so a size change would splice two files
 	body    io.ReadCloser
 	pos     int64
+
+	conns  int   // connections opened, for the summary logged on close
+	read   int64 // bytes downloaded, including skipped gaps
+	opened time.Time
 }
 
 func (s *stream) close() {
@@ -195,6 +201,10 @@ func (s *stream) open(off int64) error {
 				}
 			}
 			s.body, s.pos = resp.Body, off
+			if s.conns == 0 {
+				s.opened = time.Now()
+			}
+			s.conns++
 			return nil
 		}
 		resp.Body.Close()
@@ -220,7 +230,7 @@ func (s *stream) Read(ctx context.Context, dest []byte, off int64) (fuse.ReadRes
 				return fuse.ReadResultData(nil), 0
 			}
 		} else if off > s.pos {
-			if err := s.withDeadline(func(r io.Reader) error { _, err := io.CopyN(io.Discard, r, off-s.pos); return err }); err != nil {
+			if err := s.withDeadline(func(r io.Reader) error { n, err := io.CopyN(io.Discard, r, off-s.pos); s.read += n; return err }); err != nil {
 				s.close()
 				continue
 			}
@@ -230,6 +240,7 @@ func (s *stream) Read(ctx context.Context, dest []byte, off int64) (fuse.ReadRes
 		var n int
 		err := s.withDeadline(func(r io.Reader) (err error) { n, err = io.ReadFull(r, dest); return err })
 		s.pos += int64(n)
+		s.read += int64(n)
 		if err == nil {
 			s.served = true
 			return fuse.ReadResultData(dest), 0
@@ -252,6 +263,9 @@ func (s *stream) Release(ctx context.Context) syscall.Errno {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.close()
+	if s.conns > 0 {
+		log.Printf("close %d: %d connections, %.1f MB in %v", s.id, s.conns, float64(s.read)/1e6, time.Since(s.opened).Round(100*time.Millisecond))
+	}
 	return 0
 }
 

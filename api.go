@@ -425,7 +425,12 @@ func resolve(id int, hi bool) (string, meta, error) {
 		// Playback skips the size probe: the stream checks the size on every response (stream.open).
 		m.Size = prev.Size
 	} else if stream != "" {
+		start := time.Now()
 		size, err := probeSize(stream)
+		if err == nil {
+			u, _ := url.Parse(stream)
+			log.Printf("cdn: probe %d %s %v", id, u.Host, time.Since(start).Round(time.Millisecond))
+		}
 		if errors.Is(err, errFileGone) {
 			stream, missing = "", err
 		} else if err != nil {
