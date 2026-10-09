@@ -80,7 +80,7 @@ func TestCachedPerKeyLock(t *testing.T) {
 func TestWriteMetaAtomic(t *testing.T) {
 	cacheDir = t.TempDir()
 	os.MkdirAll(filepath.Join(cacheDir, "meta"), 0755)
-	writeMeta(1, meta{Size: 100, Plot: strings.Repeat("x", 4096)})
+	writeMeta(1, meta{Size: 100 << 20, Plot: strings.Repeat("x", 4096)})
 	stop := make(chan struct{})
 	done := make(chan struct{})
 	go func() {
@@ -90,7 +90,7 @@ func TestWriteMetaAtomic(t *testing.T) {
 			case <-stop:
 				return
 			default:
-				writeMeta(1, meta{Size: 100, Plot: strings.Repeat("x", 4096)})
+				writeMeta(1, meta{Size: 100 << 20, Plot: strings.Repeat("x", 4096)})
 			}
 		}
 	}()

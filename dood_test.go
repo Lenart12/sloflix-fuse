@@ -113,6 +113,8 @@ func TestProbeSize(t *testing.T) {
 
 // sloflix spells the source name inconsistently ("DoodStream", "Doodstream"); both must use the embed fallback.
 func TestResolveDoodSpelling(t *testing.T) {
+	var size atomic.Int64
+	size.Store(777777777)
 	var srv *httptest.Server
 	srv = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
@@ -121,7 +123,7 @@ func TestResolveDoodSpelling(t *testing.T) {
 		case strings.HasPrefix(r.URL.Path, "/pass_md5/"):
 			w.Write([]byte(srv.URL + "/file~"))
 		case strings.HasPrefix(r.URL.Path, "/file~"):
-			w.Header().Set("Content-Range", "bytes 0-0/777")
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-0/%d", size.Load()))
 			w.WriteHeader(http.StatusPartialContent)
 			w.Write([]byte("x"))
 		default: // the sloflix API
@@ -146,8 +148,20 @@ func TestResolveDoodSpelling(t *testing.T) {
 			}
 		}
 	}()
-	if _, m, err := resolve(7, false); err != nil || m.Size != 777 {
+	if _, m, err := resolve(7, false); err != nil || m.Size != 777777777 {
 		t.Fatalf("size=%d err=%v", m.Size, err)
+	}
+	// A file under minVideoSize is a broken upload: hidden like a title without a source.
+	size.Store(65536)
+	if _, _, err := resolve(8, false); err == nil || !strings.Contains(err.Error(), "broken upload") {
+		t.Fatalf("tiny file: %v", err)
+	}
+	if _, err := info(8); err == nil {
+		t.Fatal("tiny file is listed")
+	}
+	writeMeta(9, meta{Size: 65536}) // recorded as playable before minVideoSize existed
+	if _, err := info(9); err == nil {
+		t.Fatal("tiny file recorded earlier is listed")
 	}
 }
 

@@ -102,6 +102,10 @@ var (
 	doodMu     sync.Mutex
 	doodSent   []time.Time // DoodStream lookups within doodWindow, oldest first; guarded by doodMu
 	doodLastLo time.Time   // the crawler's last lookup; guarded by doodMu
+	// doodHiWaiting counts opens waiting for a slot; guarded by doodMu. doodHiWait bounds that wait: long
+	// enough for a scan's probes to queue up, short enough that an open doesn't hang. A var for tests.
+	doodHiWaiting int
+	doodHiWait    = time.Minute
 )
 
 // doodPace spaces the crawler's lookups evenly over the window, at its share of it: 5m10s / (15-3) = 25.8s.
@@ -110,13 +114,22 @@ var (
 func doodPace() time.Duration { return doodWindow / (doodMax - doodReserve) }
 
 // doodTake waits until a DoodStream lookup fits the window, then records it. A sliding window of 15 also
-// stays within a fixed window or token bucket of that size, whichever DoodStream uses. Playback doesn't
-// wait: with its reserve used up too, it fails at once rather than blocking a read for minutes.
+// stays within a fixed window or token bucket of that size, whichever DoodStream uses. Playback (any open,
+// including Jellyfin's probes) waits at most doodHiWait, and fails at once if no slot frees up by then;
+// while it waits, the crawler holds back, so opens get the whole window.
 func doodTake(hi bool) error {
 	limit := doodMax
 	if !hi {
 		limit -= doodReserve
 	}
+	deadline, waiting := time.Now().Add(doodHiWait), false
+	defer func() {
+		if waiting {
+			doodMu.Lock()
+			doodHiWaiting--
+			doodMu.Unlock()
+		}
+	}()
 	for {
 		doodMu.Lock()
 		now := time.Now()
@@ -129,6 +142,9 @@ func doodTake(hi bool) error {
 		}
 		if !hi {
 			wait = max(wait, doodLastLo.Add(doodPace()).Sub(now))
+			if doodHiWaiting > 0 {
+				wait = max(wait, time.Second) // an open is waiting: let it go first
+			}
 		}
 		if wait <= 0 {
 			doodSent = append(doodSent, now)
@@ -138,10 +154,15 @@ func doodTake(hi bool) error {
 			doodMu.Unlock()
 			return nil
 		}
-		doodMu.Unlock()
-		if hi {
+		if hi && now.Add(wait).After(deadline) {
+			doodMu.Unlock()
 			return fmt.Errorf("DoodStream lookup limit reached, free again in %v", wait.Round(time.Second))
 		}
+		if hi && !waiting {
+			doodHiWaiting++
+			waiting = true
+		}
+		doodMu.Unlock()
 		time.Sleep(wait)
 	}
 }
@@ -644,6 +665,10 @@ func resolve(id int, hi bool) (string, meta, error) {
 			stream, missing = "", err
 		} else if err != nil {
 			return "", meta{}, err
+		} else if size < minVideoSize {
+			stream, missing = "", fmt.Errorf("file is only %d bytes, likely a broken upload", size)
+			size = 0 // no source: rechecked after refreshTTL, in case it's re-uploaded
+			os.Remove(headFile(id))
 		}
 		m.Size = size
 	}
@@ -688,6 +713,10 @@ func resolve(id int, hi bool) (string, meta, error) {
 }
 
 var errFileGone = errors.New("file deleted from CDN (error_nofile)")
+
+// minVideoSize is the smallest file treated as a video. Smaller ones are broken uploads (seen: 32 KB and
+// 64 KB films, a 1.6 MB episode) that ffprobe can't read, so they're hidden like titles without a source.
+const minVideoSize = 5 << 20
 
 // probeSize returns a stream's size from a 1-byte range request. Not HEAD: some sources are presigned
 // S3/R2 URLs, signed for GET only. A DoodStream CDN whose file is gone answers 200 with "error_nofile".
@@ -878,7 +907,7 @@ func doodURL(code string, take func() error) (string, error) {
 // goneGrace (resolve keeps its size), so Jellyfin doesn't drop it and its watch history over a glitch.
 func info(id int) (meta, error) {
 	m, _, _ := readMeta(id)
-	if m.Size == 0 {
+	if m.Size < minVideoSize {
 		return m, errNoSource
 	}
 	return m, nil

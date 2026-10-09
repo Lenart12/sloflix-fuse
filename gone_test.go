@@ -49,18 +49,18 @@ func TestGoneGrace(t *testing.T) {
 		}
 	}()
 
-	writeMeta(1, meta{Size: 100})
-	if _, m, err := resolve(1, false); err == nil || m.Size != 100 || m.Gone.IsZero() {
+	writeMeta(1, meta{Size: 100 << 20})
+	if _, m, err := resolve(1, false); err == nil || m.Size != 100<<20 || m.Gone.IsZero() {
 		t.Fatalf("first gone: size=%d gone=%v err=%v", m.Size, m.Gone, err)
 	}
 	crawl(1) // recheck within grace
-	if m, err := info(1); err != nil || m.Size != 100 {
+	if m, err := info(1); err != nil || m.Size != 100<<20 {
 		t.Fatalf("within grace should stay listed: size=%d err=%v", m.Size, err)
 	}
 	delete(crawlFailed, 1)
 	captcha.Store(true) // a transient failure during the recheck
 	crawl(1)
-	if m, err := info(1); err != nil || m.Size != 100 {
+	if m, err := info(1); err != nil || m.Size != 100<<20 {
 		t.Fatalf("transient failure within grace should stay listed: size=%d err=%v", m.Size, err)
 	}
 	captcha.Store(false)

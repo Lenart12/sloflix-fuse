@@ -47,11 +47,11 @@ func TestThrottlePrefersHi(t *testing.T) {
 	}
 }
 
-// The crawler stops at doodMax-doodReserve lookups per window; playback can still use the rest, and fails
-// at once instead of waiting when the window is full.
+// The crawler stops at doodMax-doodReserve lookups per window; opens can still use the rest. An open
+// waits up to doodHiWait for a slot (failing at once if none frees up in time), and goes before the crawler.
 func TestDoodWindow(t *testing.T) {
-	defer func(w time.Duration) { doodWindow, doodSent, doodLastLo = w, nil, time.Time{} }(doodWindow)
-	doodWindow, doodLastLo = 500*time.Millisecond, time.Time{}
+	defer func(w, hw time.Duration) { doodWindow, doodHiWait, doodSent, doodLastLo = w, hw, nil, time.Time{} }(doodWindow, doodHiWait)
+	doodWindow, doodHiWait, doodLastLo = 500*time.Millisecond, 100*time.Millisecond, time.Time{}
 	start := time.Now()
 	doodSent = slices.Repeat([]time.Time{start}, doodMax-doodReserve) // the crawler's share, used
 	crawled := make(chan struct{})
@@ -64,16 +64,25 @@ func TestDoodWindow(t *testing.T) {
 	}
 	for range doodReserve {
 		if err := doodTake(true); err != nil {
-			t.Fatalf("playback lookup within the reserve: %v", err)
+			t.Fatalf("open within the reserve: %v", err)
 		}
 	}
-	if err := doodTake(true); err == nil {
-		t.Fatalf("lookup %d in a full window should fail", doodMax+1)
+	if err := doodTake(true); err == nil || time.Since(start) > 300*time.Millisecond {
+		t.Fatalf("open %d, with no slot freeing within doodHiWait, should fail at once: %v after %v", doodMax+1, err, time.Since(start))
 	}
-	<-crawled // once the oldest lookups leave the window
+	doodHiWait = time.Second
+	if err := doodTake(true); err != nil {
+		t.Fatalf("open %d should wait for the window: %v", doodMax+1, err)
+	}
 	if waited := time.Since(start); waited < 450*time.Millisecond {
-		t.Fatalf("crawler lookup %d only waited %v", doodMax-doodReserve+1, waited)
+		t.Fatalf("open %d only waited %v", doodMax+1, waited)
 	}
+	select {
+	case <-crawled:
+		t.Fatal("the crawler went before a waiting open")
+	default:
+	}
+	<-crawled
 }
 
 // The crawler's lookups are spaced doodPace apart; playback isn't paced.
@@ -90,4 +99,20 @@ func TestDoodPace(t *testing.T) {
 	if waited := time.Since(start); waited < 90*time.Millisecond {
 		t.Fatalf("second crawler lookup after %v, want the %v pace", waited, doodPace())
 	}
+
+	// While an open waits for a slot, the crawler holds back.
+	doodMu.Lock()
+	doodHiWaiting++
+	doodMu.Unlock()
+	done := make(chan struct{})
+	go func() { doodTake(false); close(done) }()
+	select {
+	case <-done:
+		t.Fatal("crawler lookup while an open was waiting")
+	case <-time.After(300 * time.Millisecond):
+	}
+	doodMu.Lock()
+	doodHiWaiting--
+	doodMu.Unlock()
+	<-done
 }
