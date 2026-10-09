@@ -13,12 +13,18 @@ import (
 
 // A listed title that upstream reports gone stays listed for goneGrace, then is hidden.
 func TestGoneGrace(t *testing.T) {
-	var apiCalls atomic.Int32
+	var apiCalls, doodCalls atomic.Int32
+	var captcha atomic.Bool
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !strings.HasPrefix(r.URL.Path, "/e/") {
 			apiCalls.Add(1)
 		}
+		if strings.HasPrefix(r.URL.Path, "/e/") && captcha.Load() {
+			w.Write([]byte(`<title>X - DoodStream.com</title><script src="turnstile.js"></script>`))
+			return
+		}
 		if strings.HasPrefix(r.URL.Path, "/e/") {
+			doodCalls.Add(1)
 			w.Write([]byte(`<title>Video not found | DoodStream</title>`))
 			return
 		}
@@ -50,6 +56,12 @@ func TestGoneGrace(t *testing.T) {
 	if m, err := info(1); err != nil || m.Size != 100 {
 		t.Fatalf("within grace should stay listed: size=%d err=%v", m.Size, err)
 	}
+	captcha.Store(true) // a transient failure during the recheck
+	if m, err := info(1); err != nil || m.Size != 100 {
+		t.Fatalf("transient failure within grace should stay listed: size=%d err=%v", m.Size, err)
+	}
+	captcha.Store(false)
+	delete(failed, 1)
 	m, _, _ := readMeta(1)
 	m.Gone = time.Now().Add(-goneGrace - time.Minute)
 	writeMeta(1, m)
@@ -58,6 +70,14 @@ func TestGoneGrace(t *testing.T) {
 	}
 	if m, _, _ := readMeta(1); m.Size != 0 {
 		t.Fatalf("after grace size=%d, want 0", m.Size)
+	}
+	// Grace rechecks asked DoodStream each time; once hidden, the known-dead ID isn't requested again.
+	if n := doodCalls.Load(); n != 3 {
+		t.Fatalf("DoodStream requests through grace = %d, want 3", n)
+	}
+	delete(failed, 1) // the hide was a lookup failure; recheck for real
+	if _, err := info(1); err == nil || doodCalls.Load() != 3 {
+		t.Fatalf("recheck of a hidden title: err=%v DoodStream requests=%d, want 3", err, doodCalls.Load())
 	}
 
 	// A failed playback lookup is remembered: retrying within playFailTTL makes no API call.

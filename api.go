@@ -145,6 +145,9 @@ type meta struct {
 	Plot    string    `json:"plot"`
 	Changed time.Time `json:"changed"`
 	Gone    time.Time `json:"gone,omitzero"` // when upstream first reported a listed title gone (see goneGrace)
+	// DeadCode is a DoodStream ID reported deleted. IDs aren't reused, so while sloflix keeps returning it,
+	// rechecks of a hidden title skip DoodStream.
+	DeadCode string `json:"dead_code,omitempty"`
 }
 
 type showInfo struct {
@@ -407,20 +410,26 @@ func resolve(id int, hi bool) (string, meta, error) {
 	}
 	// missing is set when the source exists but its video is gone; that's persisted as no source, while
 	// other errors (dead hosts, timeouts) are transient.
+	prev, _, hasPrev := readMeta(id)
 	var missing error
 	if stream == "" && doodCode != "" {
 		var err error
-		if stream, err = doodURL(doodCode); err != nil {
+		if doodCode == prev.DeadCode && prev.Size == 0 { // a title in goneGrace (Size > 0) is verified again
+			err = errVideoGone
+		} else {
+			stream, err = doodURL(doodCode)
+		}
+		if err != nil {
 			if !errors.Is(err, errVideoGone) {
 				return "", meta{}, err
 			}
 			missing = fmt.Errorf("DoodStream %s: %w", doodCode, err)
+			m.DeadCode = doodCode
 		}
 		if doodSub != nil {
 			m.Sub = *doodSub
 		}
 	}
-	prev, _, hasPrev := readMeta(id)
 	if stream != "" && hi && prev.Size > 0 {
 		// Playback skips the size probe: the stream checks the size on every response (stream.open).
 		m.Size = prev.Size
@@ -593,13 +602,13 @@ func info(id int) (meta, error) {
 		if m, ok := knownMeta(id); ok {
 			return withSize(id, m)
 		}
-		return meta{}, errFailedRecently // the lookup's owner logged why
+		return stillListed(id, errFailedRecently) // the lookup's owner logged why
 	}
 	// Lookup failures (e.g. a dead CDN node) aren't persisted, so remember them briefly to avoid
 	// retrying on every readdir/lookup/getattr.
 	if time.Since(failed[id]) < failTTL {
 		lookupMu.Unlock()
-		return meta{}, errFailedRecently
+		return stillListed(id, errFailedRecently)
 	}
 	ch := make(chan struct{})
 	lookups[id] = ch
@@ -609,19 +618,27 @@ func info(id int) (meta, error) {
 
 	lookupMu.Lock()
 	delete(lookups, id)
-	if err != nil && m.Size == 0 {
+	if err != nil {
 		failed[id] = time.Now()
 	}
 	lookupMu.Unlock()
 	close(ch)
-	if err != nil && m.Size > 0 {
-		log.Printf("media %d: %v", id, err) // gone, but within goneGrace: keep listing it
-		return m, nil
-	}
 	if err != nil {
-		return m, err
+		return stillListed(id, err)
 	}
 	return withSize(id, m)
+}
+
+// stillListed keeps a title that was playable listed through a failed recheck: a transient error, or
+// upstream reporting it gone within goneGrace. Hiding it would make Jellyfin drop it and its watch history.
+func stillListed(id int, err error) (meta, error) {
+	if m, _, ok := readMeta(id); ok && m.Size > 0 {
+		if !quiet(err) {
+			log.Printf("media %d: %v", id, err)
+		}
+		return m, nil
+	}
+	return meta{}, err
 }
 
 func withSize(id int, m meta) (meta, error) {
