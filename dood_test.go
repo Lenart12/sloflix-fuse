@@ -2,10 +2,14 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"regexp"
+	"strings"
 	"sync/atomic"
 	"testing"
 )
@@ -76,5 +80,45 @@ func TestProbeSize(t *testing.T) {
 	}
 	if _, err := probeSize(srv.URL + "/gone"); !errors.Is(err, errFileGone) {
 		t.Fatalf("gone: %v", err)
+	}
+}
+
+// sloflix spells the source name inconsistently ("DoodStream", "Doodstream"); both must use the embed fallback.
+func TestResolveDoodSpelling(t *testing.T) {
+	var srv *httptest.Server
+	srv = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/e/abc":
+			w.Write([]byte(`<script>$.get('/pass_md5/1-2/tok', function(d){})</script>`))
+		case strings.HasPrefix(r.URL.Path, "/pass_md5/"):
+			w.Write([]byte(srv.URL + "/file~"))
+		case strings.HasPrefix(r.URL.Path, "/file~"):
+			w.Header().Set("Content-Range", "bytes 0-0/777")
+			w.WriteHeader(http.StatusPartialContent)
+			w.Write([]byte("x"))
+		default: // the sloflix API
+			fmt.Fprintf(w, `{"status":"success","data":{"media_sources":[{"media_source":"https://do7go.com/e/abc","media_source_name":"SLOSubs (Doodstream)"}]}}`)
+		}
+	}))
+	defer srv.Close()
+	defer func(cdn, api *http.Client) { cdnClient, apiClient = cdn, api }(cdnClient, apiClient)
+	cdnClient, apiClient = srv.Client(), srv.Client()
+	apiBase, doodMirror = srv.URL, srv.URL+"/e/"
+	cacheDir = t.TempDir()
+	os.MkdirAll(filepath.Join(cacheDir, "meta"), 0755)
+	token, slots = "test", make(chan struct{}, 1)
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		for {
+			select {
+			case loQ <- struct{}{}:
+			case <-stop:
+				return
+			}
+		}
+	}()
+	if _, m, err := resolve(7, false); err != nil || m.Size != 777 {
+		t.Fatalf("size=%d err=%v", m.Size, err)
 	}
 }

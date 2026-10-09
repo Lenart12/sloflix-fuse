@@ -401,7 +401,7 @@ func resolve(id int, hi bool) (string, meta, error) {
 			break
 		}
 		// Embed (/e/) or download-page (/d/) links; the mirror serves either code under /e/.
-		if doodCode == "" && strings.Contains(s.Name, "DoodStream") && (strings.HasPrefix(u.Path, "/e/") || strings.HasPrefix(u.Path, "/d/")) {
+		if doodCode == "" && strings.Contains(strings.ToLower(s.Name), "doodstream") && (strings.HasPrefix(u.Path, "/e/") || strings.HasPrefix(u.Path, "/d/")) {
 			doodCode, doodSub = path.Base(u.Path), s.Sub
 		}
 	}
