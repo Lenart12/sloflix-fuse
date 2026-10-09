@@ -5,6 +5,8 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -119,6 +121,70 @@ func TestStreamSizeChange(t *testing.T) {
 	data = data[:1<<20] // replaced upstream while open
 	if _, errno := s.Read(context.Background(), make([]byte, 10), 10); errno == 0 {
 		t.Fatal("reconnect to a different-size file should fail")
+	}
+	s.Release(context.Background())
+}
+
+// Reads within a cached head never resolve a link; a read past it streams; closing removes the head.
+func TestStreamHead(t *testing.T) {
+	data := make([]byte, 2<<20)
+	for i := range data {
+		data[i] = byte(i * 7)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.ServeContent(w, r, "f.mp4", time.Time{}, bytes.NewReader(data))
+	}))
+	defer srv.Close()
+	cacheDir = t.TempDir()
+	os.MkdirAll(filepath.Join(cacheDir, "heads"), 0755)
+	os.WriteFile(headFile(9), data[:1<<20], 0644)
+	f, _ := os.Open(headFile(9))
+	var resolves atomic.Int32
+	s := &stream{id: 9, size: int64(len(data)), head: f, headLen: 1 << 20, resolve: func(bool) (string, error) {
+		resolves.Add(1)
+		return srv.URL, nil
+	}}
+	read := func(off int64, n int) {
+		t.Helper()
+		res, errno := s.Read(context.Background(), make([]byte, n), off)
+		got, _ := res.Bytes(nil)
+		if errno != 0 || !bytes.Equal(got, data[off:off+int64(n)]) {
+			t.Fatalf("read %d: errno %v, %d bytes", off, errno, len(got))
+		}
+	}
+	read(0, 4096)
+	read(1<<20-4096, 4096)
+	if resolves.Load() != 0 {
+		t.Fatalf("reads within the head resolved %d times", resolves.Load())
+	}
+	read(1<<20-100, 4096) // crosses the end of the head
+	if resolves.Load() != 1 {
+		t.Fatalf("read past the head: resolves=%d", resolves.Load())
+	}
+	s.Release(context.Background())
+	if _, err := os.Stat(headFile(9)); !os.IsNotExist(err) {
+		t.Fatalf("head not removed on close: %v", err)
+	}
+}
+
+// A head is the old file's start: once a response shows the upstream file was replaced, it's not served.
+func TestStreamHeadResized(t *testing.T) {
+	data := bytes.Repeat([]byte("n"), 1<<20)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.ServeContent(w, r, "f.mp4", time.Time{}, bytes.NewReader(data))
+	}))
+	defer srv.Close()
+	cacheDir = t.TempDir()
+	os.MkdirAll(filepath.Join(cacheDir, "heads"), 0755)
+	os.WriteFile(headFile(9), bytes.Repeat([]byte("o"), 4096), 0644)
+	f, _ := os.Open(headFile(9))
+	s := &stream{id: 9, size: 2 << 20, head: f, headLen: 4096, resolve: func(bool) (string, error) { return srv.URL, nil }}
+	if _, errno := s.Read(context.Background(), make([]byte, 100), 8192); errno != 0 || s.size != int64(len(data)) {
+		t.Fatalf("first read past the head: errno=%v size=%d", errno, s.size)
+	}
+	res, errno := s.Read(context.Background(), make([]byte, 100), 0)
+	if got, _ := res.Bytes(nil); errno != 0 || !bytes.Equal(got, data[:100]) {
+		t.Fatalf("read within the old head: errno=%v got %q", errno, got[:min(len(got), 8)])
 	}
 	s.Release(context.Background())
 }

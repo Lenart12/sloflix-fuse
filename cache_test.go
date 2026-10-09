@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -72,4 +73,34 @@ func TestCachedPerKeyLock(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("disk read waited behind another listing's fetch")
 	}
+}
+
+// Rewriting a title's meta never shows a concurrent reader a missing or half-written file (which would
+// hide the title, and Jellyfin would delete it).
+func TestWriteMetaAtomic(t *testing.T) {
+	cacheDir = t.TempDir()
+	os.MkdirAll(filepath.Join(cacheDir, "meta"), 0755)
+	writeMeta(1, meta{Size: 100, Plot: strings.Repeat("x", 4096)})
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				writeMeta(1, meta{Size: 100, Plot: strings.Repeat("x", 4096)})
+			}
+		}
+	}()
+	for i := range 5000 {
+		if _, err := info(1); err != nil {
+			close(stop)
+			<-done
+			t.Fatalf("read %d hid the title during a rewrite", i)
+		}
+	}
+	close(stop)
+	<-done
 }

@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"syscall"
 	"time"
 
@@ -20,6 +21,7 @@ func main() {
 	flag.StringVar(&cacheDir, "cache", filepath.Join(userCache, "sloflixfs"), "cache directory")
 	flag.DurationVar(&refreshTTL, "refresh", 12*time.Hour, "how long catalog listings are cached")
 	flag.DurationVar(&metaTTL, "revalidate", 7*24*time.Hour, "how often each title's size and subtitle are revalidated in the background")
+	flag.IntVar(&probeCache, "probe-cache", 500, "max new titles whose start is saved for Jellyfin's first probe, about 10-16 MB each until probed (0 = off)")
 	rate := flag.Float64("rate", 1, "max API requests per second")
 	concurrency := flag.Int("concurrency", 3, "max upstream lookups/fetches in flight (playback is exempt)")
 	limitMovies := flag.Int("limit-movies", 0, "list only the newest N movies (0 = all), for testing")
@@ -35,8 +37,10 @@ func main() {
 	}
 	slots = make(chan struct{}, *concurrency)
 	go throttleLoop(time.Duration(float64(time.Second) / *rate), hiQ, loQ)
-	go throttleLoop(doodEvery, doodHiQ, doodLoQ)
-	for _, d := range []string{"json", "meta", "subs"} {
+	// A previous run (just restarted) may have used DoodStream's limit: count the crawler's share as used,
+	// so it waits a window while playback keeps its reserve.
+	doodSent = slices.Repeat([]time.Time{time.Now()}, doodMax-doodReserve)
+	for _, d := range []string{"json", "meta", "subs", "heads"} {
 		if err := os.MkdirAll(filepath.Join(cacheDir, d), 0755); err != nil {
 			log.Fatal(err)
 		}
@@ -72,7 +76,7 @@ func main() {
 		log.Fatal(err)
 	}
 	log.Printf("mounted on %s", *mount)
-	go refresher()
+	go crawler(*limitMovies, *limitShows)
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	go func() {

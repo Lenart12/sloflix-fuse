@@ -7,12 +7,11 @@ import (
 )
 
 func TestMain(m *testing.M) {
-	go throttleLoop(time.Microsecond, doodHiQ, doodLoQ) // tests resolving DoodStream embeds don't wait 21s
+	doodWindow = time.Microsecond // tests resolving DoodStream embeds don't wait for the window
 	os.Exit(m.Run())
 }
 
-// Slots are never handed out closer than the interval, not even right after an idle period: a burst would
-// break DoodStream's 15-per-5-minutes quota.
+// Slots are never handed out closer than the interval, not even right after an idle period.
 func TestThrottleSpacing(t *testing.T) {
 	hi, lo := make(chan struct{}), make(chan struct{})
 	go throttleLoop(50*time.Millisecond, hi, lo)
@@ -29,13 +28,14 @@ func TestThrottleSpacing(t *testing.T) {
 }
 
 func TestThrottlePrefersHi(t *testing.T) {
-	go throttleLoop(20*time.Millisecond, hiQ, loQ)
+	hi, lo := make(chan struct{}), make(chan struct{}) // not hiQ/loQ: a loop left running would hand out ticks to later tests
+	go throttleLoop(20*time.Millisecond, hi, lo)
 	done := make(chan string, 6)
 	for range 5 {
-		go func() { wait(false); done <- "lo" }()
+		go func() { take(false, hi, lo); done <- "lo" }()
 	}
 	time.Sleep(5 * time.Millisecond)
-	go func() { wait(true); done <- "hi" }()
+	go func() { take(true, hi, lo); done <- "hi" }()
 	for i := range 6 {
 		if <-done == "hi" {
 			if i > 1 {
@@ -43,5 +43,39 @@ func TestThrottlePrefersHi(t *testing.T) {
 			}
 			return
 		}
+	}
+}
+
+// The crawler stops at doodMax-doodReserve lookups per window; playback can still use the rest, and fails
+// at once instead of waiting when the window is full.
+func TestDoodWindow(t *testing.T) {
+	defer func(w time.Duration) { doodWindow, doodSent = w, nil }(doodWindow)
+	doodWindow, doodSent = 500*time.Millisecond, nil
+	start := time.Now()
+	for range doodMax - doodReserve {
+		doodTake(false)
+	}
+	crawled := make(chan struct{})
+	go func() { doodTake(false); close(crawled) }()
+	time.Sleep(50 * time.Millisecond)
+	select {
+	case <-crawled:
+		t.Fatal("crawler lookup exceeded its share")
+	default:
+	}
+	for range doodReserve {
+		if err := doodTake(true); err != nil {
+			t.Fatalf("playback lookup within the reserve: %v", err)
+		}
+	}
+	if err := doodTake(true); err == nil {
+		t.Fatalf("lookup %d in a full window should fail", doodMax+1)
+	}
+	if time.Since(start) > 300*time.Millisecond {
+		t.Fatal("lookups within the limits waited")
+	}
+	<-crawled // once the oldest lookups leave the window
+	if waited := time.Since(start); waited < 450*time.Millisecond {
+		t.Fatalf("crawler lookup %d only waited %v", doodMax-doodReserve+1, waited)
 	}
 }

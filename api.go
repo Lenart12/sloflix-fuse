@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,6 +19,7 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -56,6 +58,7 @@ var (
 	cacheDir   string
 	refreshTTL time.Duration
 	metaTTL    time.Duration
+	probeCache int // -probe-cache: max saved starts of new titles awaiting Jellyfin's probe (saveHead); 0 disables
 	username   string
 	password   string
 
@@ -76,22 +79,57 @@ var (
 	fetchMu sync.Map                 // listing key -> *sync.Mutex
 	shrunk  = map[string]time.Time{} // listing key -> when it was first seen shrunk; guarded by memMu
 
-	lookupMu sync.Mutex
-	lookups  = map[int]chan struct{}{} // in-flight title lookups, closed when done; guarded by lookupMu
-	failed   = map[int]time.Time{}     // guarded by lookupMu
+	lookupMu    sync.Mutex
+	failed      = map[int]time.Time{} // failed playback lookups; guarded by lookupMu
+	crawlFailed = map[int]time.Time{} // failed crawler checks, kept apart so they don't block playback; guarded by lookupMu
 
 	slots chan struct{} // upstream lookups/fetches in flight, capped by -concurrency; set in main
 
 	hiQ = make(chan struct{})
 	loQ = make(chan struct{})
-	// DoodStream lookups have their own queue: playmogo.com (where every mirror redirects) allows 15 per
-	// IP per 5 minutes, then answers with RELOAD and a captcha for ~5 minutes (measured 2026-10-09).
-	doodHiQ = make(chan struct{})
-	doodLoQ = make(chan struct{})
 )
 
-// doodEvery spaces DoodStream lookups: 20s sustained exactly 15 per 5 minutes in testing; 21s adds margin.
-const doodEvery = 21 * time.Second
+// DoodStream lookups have their own limit: playmogo.com (where every mirror redirects) allows 15 per IP per
+// 5 minutes, then answers with RELOAD and a captcha for ~5 minutes (measured 2026-10-09). The crawler leaves
+// doodReserve of them for playback.
+const (
+	doodMax     = 15
+	doodReserve = 3
+)
+
+var (
+	doodWindow = 5*time.Minute + 10*time.Second // a var for tests
+	doodMu     sync.Mutex
+	doodSent   []time.Time // DoodStream lookups within doodWindow, oldest first; guarded by doodMu
+)
+
+// doodTake waits until a DoodStream lookup fits the window, then records it. A sliding window of 15 also
+// stays within a fixed window or token bucket of that size, whichever DoodStream uses. Playback doesn't
+// wait: with its reserve used up too, it fails at once rather than blocking a read for minutes.
+func doodTake(hi bool) error {
+	limit := doodMax
+	if !hi {
+		limit -= doodReserve
+	}
+	for {
+		doodMu.Lock()
+		now := time.Now()
+		for len(doodSent) > 0 && now.Sub(doodSent[0]) >= doodWindow {
+			doodSent = doodSent[1:]
+		}
+		if len(doodSent) < limit {
+			doodSent = append(doodSent, now)
+			doodMu.Unlock()
+			return nil
+		}
+		wait := doodSent[len(doodSent)-limit].Add(doodWindow).Sub(now)
+		doodMu.Unlock()
+		if hi {
+			return fmt.Errorf("DoodStream lookup limit reached, free again in %v", wait.Round(time.Second))
+		}
+		time.Sleep(wait)
+	}
+}
 
 // throttleLoop hands out one request slot at a time, at least every apart, preferring waiters on hi
 // (playback) over lo. The first slot after an idle period goes out at once, but never two back to back.
@@ -317,7 +355,7 @@ func login(hi bool) (string, error) {
 		return "", errors.New("login failed")
 	}
 	token = r.Metadata.AccessToken
-	return token, os.WriteFile(filepath.Join(cacheDir, "token"), []byte(token), 0600)
+	return token, writeFile(filepath.Join(cacheDir, "token"), []byte(token))
 }
 
 func doJSON(req *http.Request, out any) error {
@@ -433,7 +471,7 @@ func cached[T any](key string, fetch func() (T, error)) (T, error) {
 		return v, err
 	}
 	b, _ := json.Marshal(v)
-	os.WriteFile(file, b, 0644)
+	writeFile(file, b)
 	memMu.Lock()
 	mem[key] = memEntry{v, time.Now()}
 	memMu.Unlock()
@@ -453,7 +491,7 @@ func entries(v any) int {
 
 // catalog lists all movies (typ 1) or shows (typ 2).
 func catalog(typ int) ([]item, error) {
-	return cached(fmt.Sprintf("catalog-%d", typ), func() ([]item, error) {
+	return cached(catalogKey(typ), func() ([]item, error) {
 		var all []item
 		// 300 is the API's max page size.
 		for off := 0; ; off += 300 {
@@ -469,8 +507,33 @@ func catalog(typ int) ([]item, error) {
 	})
 }
 
+// firstN returns the first n items, or all if n is 0 (the -limit-* flags).
+func firstN(items []item, n int) []item {
+	if n > 0 {
+		return items[:min(n, len(items))]
+	}
+	return items
+}
+
+// peek returns a cached listing from memory or disk, however old, without fetching it.
+func peek[T any](key string) (T, bool) {
+	memMu.Lock()
+	e, ok := mem[key]
+	memMu.Unlock()
+	if ok {
+		return e.v.(T), true
+	}
+	var v T
+	b, err := os.ReadFile(filepath.Join(cacheDir, "json", key+".json"))
+	return v, err == nil && json.Unmarshal(b, &v) == nil
+}
+
+func catalogKey(typ int) string             { return fmt.Sprintf("catalog-%d", typ) }
+func showKey(showID int) string             { return fmt.Sprintf("show-%d", showID) }
+func episodesKey(showID, season int) string { return fmt.Sprintf("episodes-%d-%d", showID, season) }
+
 func showMeta(showID int) (showInfo, error) {
-	return cached(fmt.Sprintf("show-%d", showID), func() (showInfo, error) {
+	return cached(showKey(showID), func() (showInfo, error) {
 		var d showInfo
 		err := api(fmt.Sprintf("/media/single/%d?dont_count_view=true", showID), &d, false)
 		return d, err
@@ -478,7 +541,7 @@ func showMeta(showID int) (showInfo, error) {
 }
 
 func episodes(showID, season int) ([]item, error) {
-	return cached(fmt.Sprintf("episodes-%d-%d", showID, season), func() ([]item, error) {
+	return cached(episodesKey(showID, season), func() ([]item, error) {
 		var eps []item
 		err := api(fmt.Sprintf("/media/episodes/%d/%d", showID, season), &eps, false)
 		return eps, err
@@ -532,8 +595,11 @@ func resolve(id int, hi bool) (string, meta, error) {
 		} else {
 			// Give up the concurrency slot while queued for DoodStream, so lookups that don't need it go on.
 			release()
-			take(hi, doodHiQ, doodLoQ)
+			err = doodTake(hi)
 			release = acquire(hi)
+			if err != nil {
+				return "", meta{}, err
+			}
 			stream, err = doodURL(doodCode)
 		}
 		if err != nil {
@@ -552,7 +618,11 @@ func resolve(id int, hi bool) (string, meta, error) {
 		m.Size = prev.Size
 	} else if stream != "" {
 		start := time.Now()
-		size, err := probeSize(stream)
+		headID := 0
+		if !hi && prev.Size == 0 && headCount() < probeCache { // a new title: save its start for Jellyfin's probe
+			headID = id
+		}
+		size, err := probeSize(stream, headID)
 		if err == nil {
 			u, _ := url.Parse(stream)
 			log.Printf("cdn: probe %d %s %v", id, u.Host, time.Since(start).Round(time.Millisecond))
@@ -590,6 +660,9 @@ func resolve(id int, hi bool) (string, meta, error) {
 	if hasPrev && (prev.Size != m.Size || prev.Sub != m.Sub) {
 		log.Printf("media %d changed: size %d -> %d, sub %q -> %q", id, prev.Size, m.Size, prev.Sub, m.Sub)
 		m.Changed = time.Now()
+		if prev.Size > 0 && prev.Size != m.Size {
+			os.Remove(headFile(id)) // it's from the old file
+		}
 	}
 	writeMeta(id, m)
 	if noSource != nil {
@@ -605,15 +678,20 @@ var errFileGone = errors.New("file deleted from CDN (error_nofile)")
 
 // probeSize returns a stream's size from a 1-byte range request. Not HEAD: some sources are presigned
 // S3/R2 URLs, signed for GET only. A DoodStream CDN whose file is gone answers 200 with "error_nofile".
-func probeSize(stream string) (int64, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+// With headID set, it instead requests the whole file and saves its start for that title (see saveHead).
+func probeSize(stream string, headID int) (int64, error) {
+	timeout, rng := 15*time.Second, "bytes=0-0"
+	if headID != 0 {
+		timeout, rng = 2*time.Minute, "bytes=0-" // ~16 MB for a long film, at ~650 kB/s per connection
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	req, err := newRequest(ctx, "GET", stream, nil)
 	if err != nil {
 		return 0, err
 	}
 	req.Header.Set("Referer", referer)
-	req.Header.Set("Range", "bytes=0-0")
+	req.Header.Set("Range", rng)
 	resp, err := cdnDo(req)
 	if err != nil {
 		return 0, err
@@ -622,13 +700,77 @@ func probeSize(stream string) (int64, error) {
 	_, total, _ := strings.Cut(resp.Header.Get("Content-Range"), "/")
 	size, _ := strconv.ParseInt(total, 10, 64)
 	if resp.StatusCode == http.StatusPartialContent && size > 0 {
-		io.Copy(io.Discard, resp.Body) // read the 1 byte so the connection is reused for the stream that follows
+		if headID == 0 {
+			io.Copy(io.Discard, resp.Body) // read the 1 byte so the connection is reused for the stream that follows
+		} else if err := saveHead(headID, resp.Body); err != nil {
+			log.Printf("media %d: no probe cache: %v", headID, err) // Jellyfin's probe streams it instead
+		}
 		return size, nil
 	}
 	if b, _ := io.ReadAll(io.LimitReader(resp.Body, 64)); bytes.Contains(b, []byte("error_nofile")) {
 		return 0, errFileGone
 	}
 	return 0, fmt.Errorf("size probe %s, Content-Range %q", resp.Status, resp.Header.Get("Content-Range"))
+}
+
+const (
+	// headSlack is what Jellyfin's probe reads past the MP4 index: Jellyfin passes ffprobe no -probesize,
+	// so its default of 5 MB applies, plus up to 1 MiB of kernel readahead (MaxReadAhead), plus margin.
+	headSlack = 7 << 20
+	headMax   = 64 << 20 // an index this far in means it isn't a sane MP4 start
+	headTTL   = 3 * 24 * time.Hour
+)
+
+func headFile(id int) string { return filepath.Join(cacheDir, "heads", fmt.Sprint(id)) }
+
+// headCount is the number of saved heads, bounded by -probe-cache so they can't fill the disk before
+// Jellyfin's next scan probes (and removes) them.
+func headCount() int {
+	heads, _ := os.ReadDir(filepath.Join(cacheDir, "heads"))
+	return len(heads)
+}
+
+// saveHead saves an MP4's start, through its index (the moov box) plus headSlack, to headFile(id), so
+// Jellyfin's probe of a new title is served from disk without a stream link (stream.Read). Files with
+// the index at the end get none.
+func saveHead(id int, r io.Reader) error {
+	f, err := os.CreateTemp(filepath.Join(cacheDir, "heads"), "tmp-")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(f.Name()) // after a successful rename there's nothing left to remove
+	defer f.Close()
+	for off := int64(0); ; {
+		var hdr [16]byte
+		if _, err := io.ReadFull(r, hdr[:8]); err != nil {
+			return err
+		}
+		size, n := int64(binary.BigEndian.Uint32(hdr[:4])), int64(8)
+		if size == 1 { // 64-bit size
+			if _, err := io.ReadFull(r, hdr[8:]); err != nil {
+				return err
+			}
+			size, n = int64(binary.BigEndian.Uint64(hdr[8:])), 16
+		}
+		typ := string(hdr[4:8])
+		if typ == "mdat" || size < n || size > headMax-off { // not off+size: a huge 64-bit size would overflow
+			return fmt.Errorf("not an MP4 with its index (moov) at the start: %q box of %d bytes at %d", typ, size, off)
+		}
+		f.Write(hdr[:n])
+		if _, err := io.CopyN(f, r, size-n); err != nil {
+			return err
+		}
+		if off += size; typ == "moov" {
+			break
+		}
+	}
+	if _, err := io.CopyN(f, r, headSlack); err != nil && err != io.EOF {
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return os.Rename(f.Name(), headFile(id))
 }
 
 var (
@@ -701,75 +843,36 @@ func doodURL(code string) (string, error) {
 	return fmt.Sprintf("%s%s?token=%s&expiry=%d", base, random, path.Base(string(p)), time.Now().UnixMilli()), nil
 }
 
-// info returns persisted meta for id, resolving it if unknown. Items without a source are an error,
-// and are retried after refreshTTL.
+// info returns a title's persisted meta. Titles the crawler hasn't verified, or found without a source, are
+// an error. A playable title stays listed through transient errors and upstream reporting it gone within
+// goneGrace (resolve keeps its size), so Jellyfin doesn't drop it and its watch history over a glitch.
 func info(id int) (meta, error) {
-	if m, ok := knownMeta(id); ok {
-		return withSize(id, m)
-	}
-	lookupMu.Lock()
-	if m, ok := knownMeta(id); ok {
-		lookupMu.Unlock()
-		return withSize(id, m)
-	}
-	if ch, busy := lookups[id]; busy {
-		// Someone else is looking this title up (e.g. readdir and lookup racing): wait for their result.
-		lookupMu.Unlock()
-		<-ch
-		if m, ok := knownMeta(id); ok {
-			return withSize(id, m)
-		}
-		return stillListed(id, errFailedRecently) // the lookup's owner logged why
-	}
-	// Lookup failures (e.g. a dead CDN node) aren't persisted, so remember them briefly to avoid
-	// retrying on every readdir/lookup/getattr.
-	if time.Since(failed[id]) < failTTL {
-		lookupMu.Unlock()
-		return stillListed(id, errFailedRecently)
-	}
-	ch := make(chan struct{})
-	lookups[id] = ch
-	lookupMu.Unlock()
-
-	_, m, err := resolve(id, false)
-
-	lookupMu.Lock()
-	delete(lookups, id)
-	if err != nil {
-		failed[id] = time.Now()
-	}
-	lookupMu.Unlock()
-	close(ch)
-	if err != nil {
-		return stillListed(id, err)
-	}
-	return withSize(id, m)
-}
-
-// stillListed keeps a title that was playable listed through a failed recheck: a transient error, or
-// upstream reporting it gone within goneGrace. Hiding it would make Jellyfin drop it and its watch history.
-func stillListed(id int, err error) (meta, error) {
-	if m, _, ok := readMeta(id); ok && m.Size > 0 {
-		if !quiet(err) {
-			log.Printf("media %d: %v", id, err)
-		}
-		return m, nil
-	}
-	return meta{}, err
-}
-
-func withSize(id int, m meta) (meta, error) {
+	m, _, _ := readMeta(id)
 	if m.Size == 0 {
 		return m, errNoSource
 	}
 	return m, nil
 }
 
-// knownMeta returns persisted meta, unless it's missing or a no-source result older than refreshTTL.
-func knownMeta(id int) (meta, bool) {
-	m, written, ok := readMeta(id)
-	// No-source results and titles in their goneGrace period are rechecked after refreshTTL.
-	return m, ok && ((m.Size > 0 && m.Gone.IsZero()) || time.Since(written) < refreshTTL)
+// due reports whether the crawler should check id now, and in which order: bucket 0 is never checked,
+// 1 a title without a source or in its goneGrace period (rechecked after refreshTTL), 2 a playable one
+// (rechecked after metaTTL). written is when its meta was last written.
+func due(id int) (bucket int, written time.Time, ok bool) {
+	lookupMu.Lock()
+	recent := time.Since(crawlFailed[id]) < failTTL
+	lookupMu.Unlock()
+	if recent {
+		return 0, time.Time{}, false
+	}
+	m, written, known := readMeta(id)
+	switch {
+	case !known:
+		return 0, written, true
+	case m.Size == 0 || !m.Gone.IsZero():
+		return 1, written, time.Since(written) >= refreshTTL
+	default:
+		return 2, written, time.Since(written) >= metaTTL
+	}
 }
 
 func metaFile(id int) string {
@@ -778,7 +881,25 @@ func metaFile(id int) string {
 
 func writeMeta(id int, m meta) {
 	b, _ := json.Marshal(m)
-	os.WriteFile(metaFile(id), b, 0644)
+	writeFile(metaFile(id), b)
+}
+
+// writeFile replaces name atomically: a concurrent reader (a listing) never sees it empty or half-written,
+// and a failed write (a full disk) leaves the old content.
+func writeFile(name string, b []byte) error {
+	f, err := os.CreateTemp(filepath.Dir(name), ".tmp-")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(f.Name()) // after a successful rename there's nothing left to remove
+	if _, err := f.Write(b); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return os.Rename(f.Name(), name)
 }
 
 func readMeta(id int) (meta, time.Time, bool) {
@@ -799,6 +920,7 @@ func setSize(id int, size int64) {
 	log.Printf("media %d changed: size %d -> %d", id, m.Size, size)
 	m.Size, m.Changed = size, time.Now()
 	writeMeta(id, m)
+	os.Remove(headFile(id)) // it's from the old file
 	urlMu.Lock()
 	if e, ok := urls[id]; ok {
 		e.size = size
@@ -872,47 +994,133 @@ func fetchSubtitle(loc string) (bool, error) {
 		return false, err
 	}
 	old, _ := os.ReadFile(subFile(loc))
-	os.WriteFile(subFile(loc)+".etag", []byte(resp.Header.Get("ETag")), 0644)
-	return !bytes.Equal(old, b), os.WriteFile(subFile(loc), b, 0644)
+	writeFile(subFile(loc)+".etag", []byte(resp.Header.Get("ETag")))
+	return !bytes.Equal(old, b), writeFile(subFile(loc), b)
 }
 
-// refresher revalidates the least recently refreshed title, spread so each one comes up about every metaTTL.
-// This catches changed or removed sources and subtitles added or edited upstream for titles nobody plays.
-func refresher() {
+// crawler checks titles in the background, so listings only show playable titles and never wait on
+// upstream: new titles first (newest first), then rechecks (see due), oldest first. This also catches
+// changed or removed sources and subtitles added or edited upstream for titles nobody plays. The rate
+// limits pace it; DoodStream's leaves a reserve for playback (doodTake). Workers beyond -concurrency (which
+// still caps requests in flight) can wait for DoodStream without holding up titles that don't need it.
+func crawler(limitMovies, limitShows int) {
 	for {
-		entries, _ := os.ReadDir(filepath.Join(cacheDir, "meta"))
-		time.Sleep(max(metaTTL/time.Duration(len(entries)+1), 10*time.Second))
-		var oldest int
-		var oldestAt time.Time
-		for _, e := range entries {
-			fi, err := e.Info()
-			if err != nil {
-				continue
-			}
-			if oldest == 0 || fi.ModTime().Before(oldestAt) {
-				fmt.Sscanf(e.Name(), "%d.json", &oldest)
-				oldestAt = fi.ModTime()
-			}
+		queue := crawlQueue(limitMovies, limitShows)
+		// Rebuild at most every 10 minutes, so newly listed titles don't wait behind a long recheck queue.
+		next := time.Now().Add(10 * time.Minute)
+		ids := make(chan int)
+		var wg sync.WaitGroup
+		for range cap(slots) + doodMax {
+			wg.Go(func() {
+				for id := range ids {
+					crawl(id)
+				}
+			})
 		}
-		if oldest == 0 || time.Since(oldestAt) < metaTTL {
-			continue
+		for _, id := range queue {
+			if time.Now().After(next) {
+				break
+			}
+			ids <- id
 		}
-		_, m, err := resolve(oldest, false)
+		close(ids)
+		wg.Wait()
+		time.Sleep(time.Until(next))
+	}
+}
+
+// crawlQueue walks the catalog (the only place its listings are refreshed; readdir serves them cached) and returns the titles
+// due for a check, in order. It also removes probe caches Jellyfin never read.
+func crawlQueue(limitMovies, limitShows int) []int {
+	type task struct {
+		id, bucket int
+		at         time.Time
+	}
+	var tasks []task
+	add := func(id int, created time.Time) {
+		if bucket, written, ok := due(id); ok {
+			if bucket == 0 {
+				written = created
+			}
+			tasks = append(tasks, task{id, bucket, written})
+		}
+	}
+	movies, err := catalog(1)
+	if err != nil {
+		log.Printf("crawl: %v", err)
+	}
+	for _, it := range firstN(movies, limitMovies) {
+		add(it.ID, parseTime(it.Created))
+	}
+	shows, err := catalog(2)
+	if err != nil {
+		log.Printf("crawl: %v", err)
+	}
+	for _, show := range firstN(shows, limitShows) {
+		si, err := showMeta(show.ID)
 		if err != nil {
-			log.Printf("refresh %d: %v", oldest, err)
-			// Push it to the back of the queue so one failing title doesn't block the rest.
-			os.Chtimes(metaFile(oldest), time.Now(), time.Now())
+			log.Printf("crawl: show %d: %v", show.ID, err)
 			continue
 		}
-		if _, err := os.Stat(subFile(m.Sub)); m.Sub == "" || err != nil {
-			continue
+		for _, s := range si.Seasons {
+			eps, err := episodes(show.ID, s)
+			if err != nil {
+				log.Printf("crawl: show %d season %d: %v", show.ID, s, err)
+			}
+			for _, ep := range eps {
+				add(ep.ID, parseTime(ep.Created))
+			}
 		}
-		if changed, err := fetchSubtitle(m.Sub); err != nil {
-			log.Printf("refresh %d: %v", oldest, err)
-		} else if changed {
-			log.Printf("media %d: subtitle %s changed", oldest, m.Sub)
-			m.Changed = time.Now()
-			writeMeta(oldest, m)
+	}
+	slices.SortFunc(tasks, func(a, b task) int {
+		if a.bucket != b.bucket {
+			return a.bucket - b.bucket
 		}
+		if a.bucket == 0 {
+			return b.at.Compare(a.at) // newest first
+		}
+		return a.at.Compare(b.at) // least recently checked first
+	})
+	ids, fresh := make([]int, len(tasks)), 0
+	for i, t := range tasks {
+		ids[i] = t.id
+		if t.bucket == 0 {
+			fresh++
+		}
+	}
+	heads, _ := os.ReadDir(filepath.Join(cacheDir, "heads"))
+	for _, e := range heads {
+		if fi, err := e.Info(); err == nil && time.Since(fi.ModTime()) > headTTL {
+			os.Remove(filepath.Join(cacheDir, "heads", e.Name()))
+		}
+	}
+	if len(ids) > 0 {
+		log.Printf("crawl: %d new, %d to recheck; %d of %d probe cache slots used", fresh, len(ids)-fresh, headCount(), probeCache)
+	}
+	return ids
+}
+
+// crawl checks one title, unless playback did meanwhile, and revalidates its cached subtitle.
+func crawl(id int) {
+	if _, _, ok := due(id); !ok {
+		return
+	}
+	_, m, err := resolve(id, false)
+	if err != nil {
+		lookupMu.Lock()
+		crawlFailed[id] = time.Now() // transient errors aren't persisted; don't retry for failTTL
+		lookupMu.Unlock()
+		log.Printf("crawl %d: %v", id, err)
+		return
+	}
+	if _, err := os.Stat(subFile(m.Sub)); m.Sub == "" || err != nil {
+		return
+	}
+	if changed, err := fetchSubtitle(m.Sub); err != nil {
+		log.Printf("crawl %d: %v", id, err)
+	} else if changed {
+		log.Printf("media %d: subtitle %s changed", id, m.Sub)
+		m.Changed = time.Now()
+		writeMeta(id, m)
 	}
 }

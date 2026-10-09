@@ -34,8 +34,8 @@ func TestGoneGrace(t *testing.T) {
 	apiBase, doodMirror = srv.URL, srv.URL+"/e/"
 	cacheDir = t.TempDir()
 	os.MkdirAll(filepath.Join(cacheDir, "meta"), 0755)
-	token, refreshTTL = "test", 0 // refreshTTL 0: every listing rechecks titles in their grace period
-	slots, failed = make(chan struct{}, 1), map[int]time.Time{}
+	token, refreshTTL = "test", 0 // refreshTTL 0: every crawl rechecks titles in their grace period
+	slots, failed, crawlFailed = make(chan struct{}, 1), map[int]time.Time{}, map[int]time.Time{}
 	stop := make(chan struct{})
 	defer close(stop)
 	go func() { // hand out rate-limit ticks freely
@@ -53,18 +53,22 @@ func TestGoneGrace(t *testing.T) {
 	if _, m, err := resolve(1, false); err == nil || m.Size != 100 || m.Gone.IsZero() {
 		t.Fatalf("first gone: size=%d gone=%v err=%v", m.Size, m.Gone, err)
 	}
+	crawl(1) // recheck within grace
 	if m, err := info(1); err != nil || m.Size != 100 {
 		t.Fatalf("within grace should stay listed: size=%d err=%v", m.Size, err)
 	}
+	delete(crawlFailed, 1)
 	captcha.Store(true) // a transient failure during the recheck
+	crawl(1)
 	if m, err := info(1); err != nil || m.Size != 100 {
 		t.Fatalf("transient failure within grace should stay listed: size=%d err=%v", m.Size, err)
 	}
 	captcha.Store(false)
-	delete(failed, 1)
+	delete(crawlFailed, 1)
 	m, _, _ := readMeta(1)
 	m.Gone = time.Now().Add(-goneGrace - time.Minute)
 	writeMeta(1, m)
+	crawl(1)
 	if _, err := info(1); err == nil {
 		t.Fatal("after grace should be hidden")
 	}
@@ -75,7 +79,8 @@ func TestGoneGrace(t *testing.T) {
 	if n := doodCalls.Load(); n != 3 {
 		t.Fatalf("DoodStream requests through grace = %d, want 3", n)
 	}
-	delete(failed, 1) // the hide was a lookup failure; recheck for real
+	delete(crawlFailed, 1) // the hide was a lookup failure; recheck for real
+	crawl(1)
 	if _, err := info(1); err == nil || doodCalls.Load() != 3 {
 		t.Fatalf("recheck of a hidden title: err=%v DoodStream requests=%d, want 3", err, doodCalls.Load())
 	}
