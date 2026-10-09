@@ -52,10 +52,10 @@ var (
 	urlMu sync.Mutex
 	urls  = map[int]urlEntry{}
 
-	// ponytail: one global lock dedupes concurrent catalog/list fetches; fine since they only hit the
-	// throttled API with a 30s timeout. Per-key in-flight tracking (like lookups) if that becomes a bottleneck.
-	fetchMu sync.Mutex
-	shrunk  = map[string]time.Time{} // listing key -> when it was first seen shrunk; guarded by fetchMu
+	// fetchMu holds one lock per listing key, so concurrent requests for a listing share one fetch while
+	// other listings (and their disk reads) don't wait behind it.
+	fetchMu sync.Map                 // listing key -> *sync.Mutex
+	shrunk  = map[string]time.Time{} // listing key -> when it was first seen shrunk; guarded by memMu
 
 	lookupMu sync.Mutex
 	lookups  = map[int]chan struct{}{} // in-flight title lookups, closed when done; guarded by lookupMu
@@ -250,8 +250,9 @@ func cached[T any](key string, fetch func() (T, error)) (T, error) {
 	if ok && time.Since(e.at) < refreshTTL {
 		return e.v.(T), nil
 	}
-	fetchMu.Lock()
-	defer fetchMu.Unlock()
+	mu, _ := fetchMu.LoadOrStore(key, new(sync.Mutex))
+	mu.(*sync.Mutex).Lock()
+	defer mu.(*sync.Mutex).Unlock()
 	memMu.Lock()
 	e, ok = mem[key]
 	memMu.Unlock()
@@ -275,6 +276,7 @@ func cached[T any](key string, fetch func() (T, error)) (T, error) {
 	release := acquire(false)
 	v, err := fetch()
 	release()
+	memMu.Lock()
 	if err == nil && ok && entries(v)*10 < entries(e.v)*9 {
 		if first, seen := shrunk[key]; !seen {
 			shrunk[key] = time.Now()
@@ -288,10 +290,11 @@ func cached[T any](key string, fetch func() (T, error)) (T, error) {
 	if err == nil {
 		delete(shrunk, key)
 	}
+	memMu.Unlock()
 	if err != nil {
 		if ok {
 			log.Printf("refresh %s failed, serving stale: %v", key, err)
-			// Keep serving the stale copy for failTTL instead of retrying (under fetchMu) on every listing.
+			// Keep serving the stale copy for failTTL instead of retrying on every listing.
 			memMu.Lock()
 			mem[key] = memEntry{e.v, time.Now().Add(failTTL - refreshTTL)}
 			memMu.Unlock()
